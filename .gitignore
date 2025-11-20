@@ -1,0 +1,25 @@
+# Rust
+/server/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node.js
+/admin-ui/node_modules/
+/admin-ui/dist/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.wasm
+
+# Documentation (temporarily ignored)
+/docs/
