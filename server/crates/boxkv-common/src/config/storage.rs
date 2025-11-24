@@ -1,17 +1,18 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 use thiserror::Error;
+use tracing::info;
 
 /// Errors that can occur during storage configuration validation.
 #[derive(Debug, Error)]
 pub enum StorageConfigError {
     /// The memtable size is outside the allowed range (1-1024 MB).
     #[error("Invalid memtable size: {size} MB, must between 1 and 1024")]
-    InvalidMemtableSize{ size: usize },
+    InvalidMemtableSize { size: usize },
 
     /// The data directory is not writable or cannot be created.
     #[error("Directory not writable: {path:?}")]
-    DirNotWritable{
+    DirNotWritable {
         path: PathBuf,
         #[source]
         error: std::io::Error,
@@ -38,8 +39,12 @@ const DEFAULT_MEMTABLE_SIZE_MB: usize = 4;
 const MIN_MEMTABLE_SIZE_MB: usize = 1;
 const MAX_MEMTABLE_SIZE_MB: usize = 1024;
 
-fn default_data_dir() -> PathBuf { PathBuf::from(DEFAULT_DATA_DIR) }
-fn default_memtable_size() -> usize { DEFAULT_MEMTABLE_SIZE_MB }
+fn default_data_dir() -> PathBuf {
+    PathBuf::from(DEFAULT_DATA_DIR)
+}
+fn default_memtable_size() -> usize {
+    DEFAULT_MEMTABLE_SIZE_MB
+}
 
 impl Default for StorageConfig {
     fn default() -> Self {
@@ -75,19 +80,22 @@ impl StorageConfig {
 
     fn check_data_dir(&self) -> Result<(), StorageConfigError> {
         if !self.data_dir.exists() {
-            std::fs::create_dir_all(&self.data_dir)
-                .map_err(|e| StorageConfigError::DirNotWritable {
+            info!(?self.data_dir, "Creating data directory");
+            std::fs::create_dir_all(&self.data_dir).map_err(|e| {
+                StorageConfigError::DirNotWritable {
                     path: self.data_dir.clone(),
                     error: e,
-                })?;
+                }
+            })?;
         }
 
         let test_file = self.data_dir.join(".write_test");
-        std::fs::write(&test_file, b"test")
-            .map_err(|error| StorageConfigError::DirNotWritable {
+        std::fs::write(&test_file, b"test").map_err(|error| {
+            StorageConfigError::DirNotWritable {
                 path: self.data_dir.clone(),
                 error,
-            })?;
+            }
+        })?;
         std::fs::remove_file(test_file).ok();
 
         Ok(())
@@ -110,17 +118,17 @@ mod tests {
     fn test_valid_memtable_size() {
         let test_dir = PathBuf::from("./test_data_valid");
         fs::remove_dir_all(&test_dir).ok();
-        
+
         let config = StorageConfig {
             data_dir: test_dir.clone(),
             memtable_size_mb: 64,
         };
-        
+
         let result = config.validate();
-        
+
         // Cleanup
         fs::remove_dir_all(&test_dir).ok();
-        
+
         assert!(result.is_ok(), "Validation failed: {:?}", result.err());
     }
 
@@ -144,15 +152,15 @@ mod tests {
     fn test_invalid_memtable_size_too_large() {
         let test_dir = PathBuf::from("./test_data_large");
         fs::remove_dir_all(&test_dir).ok();
-        
+
         let config = StorageConfig {
             data_dir: test_dir.clone(),
             memtable_size_mb: 2048,
         };
         let result = config.validate();
-        
+
         fs::remove_dir_all(&test_dir).ok();
-        
+
         assert!(result.is_err(), "Expected error for size 2048, but got Ok");
         match result.unwrap_err() {
             StorageConfigError::InvalidMemtableSize { size } => {
@@ -167,7 +175,7 @@ mod tests {
         // min valid value
         let test_dir_1 = PathBuf::from("./test_boundary_1");
         fs::remove_dir_all(&test_dir_1).ok();
-        
+
         let config = StorageConfig {
             data_dir: test_dir_1.clone(),
             memtable_size_mb: 1,
@@ -179,7 +187,7 @@ mod tests {
         //max valid value
         let test_dir_1024 = PathBuf::from("./test_boundary_1024");
         fs::remove_dir_all(&test_dir_1024).ok();
-        
+
         let config = StorageConfig {
             data_dir: test_dir_1024.clone(),
             memtable_size_mb: 1024,
@@ -191,7 +199,7 @@ mod tests {
         // below min
         let test_dir_0 = PathBuf::from("./test_boundary_0");
         fs::remove_dir_all(&test_dir_0).ok();
-        
+
         let config = StorageConfig {
             data_dir: test_dir_0.clone(),
             memtable_size_mb: 0,
@@ -203,7 +211,7 @@ mod tests {
         // above max
         let test_dir_1025 = PathBuf::from("./test_boundary_1025");
         fs::remove_dir_all(&test_dir_1025).ok();
-        
+
         let config = StorageConfig {
             data_dir: test_dir_1025.clone(),
             memtable_size_mb: 1025,
@@ -216,20 +224,20 @@ mod tests {
     #[test]
     fn test_data_dir_creation() {
         let test_dir = PathBuf::from("./test_data_creation");
-        
+
         // Ensure directory does not exist
         fs::remove_dir_all(&test_dir).ok();
-        
+
         let config = StorageConfig {
             data_dir: test_dir.clone(),
             memtable_size_mb: 64,
         };
-        
+
         // Should succeed and create directory
         let result = config.validate();
         assert!(result.is_ok(), "Validation failed: {:?}", result.err());
         assert!(test_dir.exists(), "Directory was not created");
-        
+
         // Cleanup
         fs::remove_dir_all(&test_dir).ok();
     }
@@ -239,18 +247,18 @@ mod tests {
         let test_dir = PathBuf::from("./test_data_writable");
         fs::remove_dir_all(&test_dir).ok();
         fs::create_dir_all(&test_dir).expect("Failed to create test directory");
-        
+
         let config = StorageConfig {
             data_dir: test_dir.clone(),
             memtable_size_mb: 64,
         };
-        
+
         // Should succeed
         let result = config.validate();
-        
+
         // Cleanup
         fs::remove_dir_all(&test_dir).ok();
-        
+
         assert!(result.is_ok(), "Validation failed: {:?}", result.err());
     }
 

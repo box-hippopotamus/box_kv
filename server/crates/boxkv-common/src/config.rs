@@ -9,6 +9,7 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use thiserror::Error;
+use tracing::{debug, info};
 
 /// Errors that can occur during configuration loading or validation.
 #[derive(Debug, Error)]
@@ -39,7 +40,7 @@ pub struct Config {
     /// Configuration for the storage engine.
     #[serde(default)]
     pub storage: StorageConfig,
-    
+
     /// Configuration for the network server.
     #[serde(default)]
     pub server: ServerConfig,
@@ -54,7 +55,9 @@ impl Config {
     ///
     /// Panics if `Config::init()` has not been called successfully before calling this method.
     pub fn global() -> &'static Self {
-        CONFIG.get().expect("Config is not initialized! Call Config::init() first.")
+        CONFIG
+            .get()
+            .expect("Config is not initialized! Call Config::init() first.")
     }
 
     /// Initializes the global configuration.
@@ -69,6 +72,7 @@ impl Config {
     /// Returns `ConfigError` if loading or validation fails.
     pub fn init() -> Result<(), ConfigError> {
         if CONFIG.get().is_none() {
+            info!("Initializing BoxKV configuration");
             let config = Config::load()?;
             let _ = CONFIG.set(config);
         }
@@ -81,16 +85,15 @@ impl Config {
 
         // 1. Try to load the configuration file
         if let Some(config_file) = Self::find_config_file()? {
-            builder = builder.add_source(
-                config::File::from(config_file).required(true)
-            );
+            info!(?config_file, "Loading configuration file");
+            builder = builder.add_source(config::File::from(config_file).required(true));
+        } else {
+            info!("No config file found, using defaults and environment variables");
         }
 
         // 2. Environment variable override
-        builder = builder.add_source(
-            config::Environment::with_prefix(ENV_PREFIX)
-                .separator(ENV_SEPARATOR)
-        );
+        builder = builder
+            .add_source(config::Environment::with_prefix(ENV_PREFIX).separator(ENV_SEPARATOR));
 
         // 3. Build and deserialize
         let config: Self = builder
@@ -101,6 +104,14 @@ impl Config {
 
         // 4. Validate
         config.validate()?;
+
+        debug!(
+            data_dir = ?config.storage.data_dir,
+            memtable_size_mb = config.storage.memtable_size_mb,
+            host = %config.server.host,
+            port = config.server.port,
+            "Configuration loaded and validated"
+        );
 
         Ok(config)
     }
@@ -116,7 +127,7 @@ impl Config {
         if let Ok(path) = env::var(ENV_VAR_CONFIG_FILE) {
             let path = PathBuf::from(path);
             return if !path.exists() {
-                Err(ConfigError::FileNotFound {path})
+                Err(ConfigError::FileNotFound { path })
             } else {
                 Ok(Some(path))
             };
@@ -172,8 +183,10 @@ mod tests {
 
     #[test]
     fn test_find_config_file_none() {
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         let default_path = DEFAULT_CONFIG_PATH;
         fs::remove_file(default_path).ok();
 
@@ -184,59 +197,77 @@ mod tests {
 
     #[test]
     fn test_find_config_file_default_exists() {
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         let config_path = DEFAULT_CONFIG_PATH;
         fs::remove_file(config_path).ok();
-        
+
         create_test_config_file(config_path, "[storage]\ndata_dir = \"./data\"\n");
-        
+
         let result = Config::find_config_file();
-        
+
         fs::remove_file(config_path).ok();
-        
-        assert!(result.is_ok(), "find_config_file failed: {:?}", result.err());
+
+        assert!(
+            result.is_ok(),
+            "find_config_file failed: {:?}",
+            result.err()
+        );
         assert_eq!(result.unwrap(), Some(PathBuf::from(config_path)));
     }
 
     #[test]
     fn test_find_config_file_env_exists() {
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         let test_dir = "./test_configs_env_exists";
         let test_config = format!("{}/env_test.toml", test_dir);
-        
+
         fs::remove_file(&test_config).ok();
         fs::remove_dir_all(test_dir).ok();
-        
+
         create_test_config_file(&test_config, "[storage]\ndata_dir = \"./data\"\n");
-        
-        unsafe { env::set_var(ENV_VAR_CONFIG_FILE, &test_config); }
+
+        unsafe {
+            env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
+        }
 
         let result = Config::find_config_file();
-        
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         fs::remove_file(&test_config).ok();
         fs::remove_dir_all(test_dir).ok();
-        
+
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some(PathBuf::from(test_config.as_str())));
     }
 
     #[test]
     fn test_find_config_file_env_not_exists() {
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         let non_existent = "./test_configs/non_existent.toml";
-        unsafe { env::set_var(ENV_VAR_CONFIG_FILE, non_existent); }
+        unsafe {
+            env::set_var(ENV_VAR_CONFIG_FILE, non_existent);
+        }
 
         let result = Config::find_config_file();
-        
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         assert!(result.is_err());
-        
+
         match result.unwrap_err() {
             ConfigError::FileNotFound { path } => {
                 assert_eq!(path, PathBuf::from(non_existent));
@@ -247,27 +278,33 @@ mod tests {
 
     #[test]
     fn test_find_config_file_env_priority() {
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         let env_config = "./test_configs_priority/env_priority.toml";
         let default_config = "./config_priority.toml";
         fs::remove_file(env_config).ok();
         fs::remove_file(default_config).ok();
         fs::remove_dir_all("./test_configs_priority").ok();
-        
+
         create_test_config_file(env_config, "[storage]\nmemtable_size_mb = 128\n");
         create_test_config_file(default_config, "[storage]\nmemtable_size_mb = 64\n");
 
-        unsafe { env::set_var(ENV_VAR_CONFIG_FILE, env_config); }
+        unsafe {
+            env::set_var(ENV_VAR_CONFIG_FILE, env_config);
+        }
 
         let result = Config::find_config_file();
-        
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         fs::remove_file(env_config).ok();
         fs::remove_file(default_config).ok();
         fs::remove_dir_all("./test_configs_priority").ok();
-        
+
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some(PathBuf::from(env_config)));
     }
@@ -281,45 +318,52 @@ mod tests {
         assert!(msg.contains("Config file not found"));
         assert!(msg.contains("/path/to/config.toml"));
 
-        let err = ConfigError::ParseError(
-            config::ConfigError::Message("test error".to_string())
-        );
+        let err = ConfigError::ParseError(config::ConfigError::Message("test error".to_string()));
         let msg = format!("{}", err);
         assert!(msg.contains("Failed to parse config"));
     }
 
     #[test]
     fn test_config_default_values() {
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         let test_data_dir = "./test_data_default";
-        
+
         fs::remove_dir_all("./test_configs_default").ok();
         fs::remove_dir_all(test_data_dir).ok();
-        
-        let config_content = format!(r#"
+
+        let config_content = format!(
+            r#"
 [storage]
 data_dir = "{}"
 
 [server]
 host = "127.0.0.1"
 port = 21524
-"#, test_data_dir);
-        
+"#,
+            test_data_dir
+        );
+
         let test_config = "./test_configs_default/default_test.toml";
         create_test_config_file(test_config, &config_content);
-        unsafe { env::set_var(ENV_VAR_CONFIG_FILE, test_config); }
+        unsafe {
+            env::set_var(ENV_VAR_CONFIG_FILE, test_config);
+        }
 
         let result = Config::load();
-        
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         assert!(result.is_ok(), "Config load failed: {:?}", result.err());
         let config = result.unwrap();
         assert_eq!(config.storage.data_dir, PathBuf::from(test_data_dir));
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 21524);
-        
+
         fs::remove_file(test_config).ok();
         fs::remove_dir_all("./test_configs_default").ok();
         fs::remove_dir_all(test_data_dir).ok();
@@ -327,15 +371,18 @@ port = 21524
 
     #[test]
     fn test_config_custom_values() {
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         let test_dir = "./test_configs_custom";
         let data_dir = "./test_data_custom";
-        
+
         fs::remove_dir_all(test_dir).ok();
         fs::remove_dir_all(data_dir).ok();
-        
-        let config_content = format!(r#"
+
+        let config_content = format!(
+            r#"
 [storage]
 data_dir = "{}"
 memtable_size_mb = 128
@@ -343,24 +390,30 @@ memtable_size_mb = 128
 [server]
 host = "0.0.0.0"
 port = 8080
-"#, data_dir);
-        
+"#,
+            data_dir
+        );
+
         let test_config = format!("{}/custom_test.toml", test_dir);
         create_test_config_file(&test_config, &config_content);
-        
-        unsafe { env::set_var(ENV_VAR_CONFIG_FILE, &test_config); }
+
+        unsafe {
+            env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
+        }
 
         let result = Config::load();
-        
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         assert!(result.is_ok(), "Config load failed: {:?}", result.err());
         let config = result.unwrap();
         assert_eq!(config.storage.data_dir, PathBuf::from(data_dir));
         assert_eq!(config.storage.memtable_size_mb, 128);
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 8080);
-        
+
         fs::remove_file(&test_config).ok();
         fs::remove_dir_all(test_dir).ok();
         fs::remove_dir_all(data_dir).ok();
@@ -368,14 +421,16 @@ port = 8080
 
     #[test]
     fn test_config_validation_fail_storage() {
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         let test_dir = "./test_configs_fail_storage";
         let data_dir = "./test_data_fail_storage";
-        
+
         fs::remove_dir_all(test_dir).ok();
         fs::remove_dir_all(data_dir).ok();
-        
+
         let config_content = r#"
 [storage]
 memtable_size_mb = 0
@@ -384,38 +439,45 @@ memtable_size_mb = 0
 host = "127.0.0.1"
 port = 8080
 "#;
-        
+
         let test_config = format!("{}/validation_fail_storage.toml", test_dir);
         create_test_config_file(&test_config, config_content);
-        
-        unsafe { env::set_var(ENV_VAR_CONFIG_FILE, &test_config); }
+
+        unsafe {
+            env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
+        }
 
         let result = Config::load();
-        
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         fs::remove_file(&test_config).ok();
         fs::remove_dir_all(test_dir).ok();
         fs::remove_dir_all(data_dir).ok();
 
         assert!(result.is_err(), "Expected error but got Ok");
         match result.unwrap_err() {
-            ConfigError::Storage(_) => {}, // Expected
+            ConfigError::Storage(_) => {} // Expected
             e => panic!("Expected Storage error, got: {:?}", e),
         }
     }
 
     #[test]
     fn test_config_validation_fail_server() {
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         let test_dir = "./test_configs_fail_server";
         let data_dir = "./test_data_fail_server";
-        
+
         fs::remove_dir_all(test_dir).ok();
         fs::remove_dir_all(data_dir).ok();
-        
-        let config_content = format!(r#"
+
+        let config_content = format!(
+            r#"
 [storage]
 data_dir = "{}"
 memtable_size_mb = 64
@@ -423,54 +485,66 @@ memtable_size_mb = 64
 [server]
 host = "invalid-host"
 port = 8080
-"#, data_dir);
-        
+"#,
+            data_dir
+        );
+
         let test_config = format!("{}/validation_fail_server.toml", test_dir);
         create_test_config_file(&test_config, &config_content);
-        
-        unsafe { env::set_var(ENV_VAR_CONFIG_FILE, &test_config); }
+
+        unsafe {
+            env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
+        }
 
         let result = Config::load();
-        
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         fs::remove_file(&test_config).ok();
         fs::remove_dir_all(test_dir).ok();
         fs::remove_dir_all(data_dir).ok();
 
         assert!(result.is_err(), "Expected error but got Ok");
         match result.unwrap_err() {
-            ConfigError::Server(_) => {}, // Expected
+            ConfigError::Server(_) => {} // Expected
             e => panic!("Expected Server error, but got: {:?}", e),
         }
     }
 
     #[test]
     fn test_config_parse_error() {
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         let test_dir = "./test_configs_parse_error";
         fs::remove_dir_all(test_dir).ok();
-        
+
         let config_content = r#"
 [storage]
 memtable_size_mb = "not_a_number"
 "#;
-        
+
         let test_config = format!("{}/parse_error_test.toml", test_dir);
         create_test_config_file(&test_config, config_content);
-        unsafe { env::set_var(ENV_VAR_CONFIG_FILE, &test_config); }
+        unsafe {
+            env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
+        }
 
         let result = Config::load();
-        
-        unsafe { env::remove_var(ENV_VAR_CONFIG_FILE); }
-        
+
+        unsafe {
+            env::remove_var(ENV_VAR_CONFIG_FILE);
+        }
+
         fs::remove_file(&test_config).ok();
         fs::remove_dir_all(test_dir).ok();
-        
+
         assert!(result.is_err());
         match result.unwrap_err() {
-            ConfigError::ParseError(_) => {}, // Expected
+            ConfigError::ParseError(_) => {} // Expected
             _ => panic!("Expected ParseError"),
         }
     }

@@ -3,6 +3,7 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 use thiserror::Error;
+use tracing::debug;
 
 use super::{LogRecord, WAL_KEY_LEN_SIZE, WAL_VAL_LEN_SIZE};
 
@@ -23,12 +24,12 @@ pub struct WalWriter {
 impl WalWriter {
     /// Creates a new `WalWriter` for the specified path.
     pub fn new(path: PathBuf) -> Result<Self, WriteError> {
+        debug!(?path, "Creating WalWriter");
+
         let file = File::create(path)?;
         let writer = BufWriter::new(file);
 
-        Ok(Self {
-            writer,
-        })
+        Ok(Self { writer })
     }
 
     /// Serializes and appends a `LogRecord` to the WAL buffer.
@@ -40,7 +41,7 @@ impl WalWriter {
         let key_len = record.key.len() as u64;
         let val_len = record.value.len() as u64;
         let seq = record.seq;
-        
+
         // Calculate the payload length: Key Length + Value Length + Key Data + Value Data
         let payload_len = (WAL_KEY_LEN_SIZE + WAL_VAL_LEN_SIZE) as u64 + key_len + val_len;
 

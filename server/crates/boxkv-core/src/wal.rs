@@ -1,13 +1,14 @@
-mod writer;
 mod reader;
+mod writer;
 
+use crate::wal::reader::{ReadError, WalIterator};
+use crate::wal::writer::{WalWriter, WriteError};
+use bytes::Bytes;
 use std::fs;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use bytes::Bytes;
 use thiserror::Error;
-use crate::wal::reader::{ReadError, WalIterator};
-use crate::wal::writer::{WalWriter, WriteError};
+use tracing::{debug, info, trace, warn};
 
 #[derive(Debug, Error)]
 pub enum WalError {
@@ -86,7 +87,7 @@ pub struct LogRecord {
     pub seq: u64,
     pub key: Bytes,
     pub value: Bytes,
-    pub rec_type: LogRecordType, 
+    pub rec_type: LogRecordType,
 }
 
 #[repr(u8)]
@@ -123,7 +124,9 @@ impl Wal {
     pub fn create(dir: PathBuf, file_id: u64) -> Result<Self, WalError> {
         let path = dir.join(format!("{:09}.wal", file_id));
 
-        Ok(Self{
+        info!(file_id, ?path, "Creating WAL file");
+
+        Ok(Self {
             writer: WalWriter::new(path.clone()).with_context(&path)?,
             path,
         })
@@ -138,92 +141,129 @@ impl Wal {
     /// - A vector of valid `LogRecord`s to be replayed into the Memtable.
     /// - The maximum sequence number found during recovery.
     pub fn read_all_logs(dir: PathBuf, min_seq: u64) -> Result<(Vec<LogRecord>, u64), WalError> {
+        info!(min_seq, ?dir, "Starting WAL recovery");
+        let start = std::time::Instant::now();
+
         let read_dir = fs::read_dir(&dir).with_context(&dir)?;
 
         let mut wal_files: Vec<(u64, PathBuf)> = Vec::new();
-        
+
         // 1. Scan directory for WAL files
         for entry in read_dir {
             let entry = entry.with_context(&dir)?;
             let path = entry.path();
-    
+
             if !path.is_file() {
                 continue;
             }
-    
+
             if path.extension().and_then(|s| s.to_str()) != Some("wal") {
                 continue;
             }
-    
+
             // Parse file ID from filename (e.g., "000000001.wal" -> 1)
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if let Ok(id) = stem.parse::<u64>() {
-                    wal_files.push((id, path));
-                }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                && let Ok(id) = stem.parse::<u64>()
+            {
+                wal_files.push((id, path));
             }
         }
 
         // 2. Sort files by ID to ensure chronological order
         wal_files.sort_unstable_by_key(|&(id, _)| id);
 
+        debug!(file_count = wal_files.len(), "Scanned WAL files");
+
         let mut max_seq = u64::MIN;
         let mut all_records = Vec::new();
 
         // 3. Iterate through each file and read records
-        for (_, path) in &wal_files {
-            let file = File::open(&path).with_context(&path)?;
+        for (file_id, path) in &wal_files {
+            let file = File::open(path).with_context(path)?;
             let read_it = WalIterator::new(file);
 
+            let mut record_count = 0;
             for res in read_it {
                 match res {
                     Ok(record) => {
                         if record.seq >= min_seq {
                             max_seq = max_seq.max(record.seq);
                             all_records.push(record);
+                            record_count += 1;
                         }
                     }
                     Err(ReadError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                         // Warn: WAL file truncated at the end.
                         // This is expected if the system crashed while writing the last record.
                         // We ignore the partial record and stop reading this file.
-                        break; 
+                        warn!(
+                            file_id,
+                            ?path,
+                            "WAL file truncated, skipping partial record"
+                        );
+                        break;
                     }
-                    Err(e) => return Err(WalError::Read {
-                        path: path.clone(),
-                        source: e
-                    }),
+                    Err(e) => {
+                        return Err(WalError::Read {
+                            path: path.clone(),
+                            source: e,
+                        });
+                    }
                 }
             }
+
+            debug!(file_id, record_count, ?path, "Completed reading WAL file");
         }
 
         // 4. Final sort by sequence number
         // This handles potential out-of-order writes if multiple threads allocated Seqs
         // but wrote to the WAL in a slightly different physical order.
         all_records.sort_by_key(|r| r.seq);
-        
+
+        let elapsed = start.elapsed();
+        info!(
+            record_count = all_records.len(),
+            max_seq,
+            elapsed_ms = elapsed.as_millis(),
+            "WAL recovery completed"
+        );
+
         Ok((all_records, max_seq))
     }
 
     /// Appends a Put operation (Key-Value pair) to the WAL.
     pub fn append_put(&mut self, key: &[u8], value: &[u8], seq: u64) -> Result<(), WalError> {
-        self.writer.append(&LogRecord {
+        trace!(
             seq,
-            key: Bytes::from(key.to_vec()),
-            value: Bytes::from(value.to_vec()),
-            rec_type: LogRecordType::Normal,
-        }).with_context(&self.path)?;
+            key_len = key.len(),
+            val_len = value.len(),
+            "Appending PUT to WAL"
+        );
+
+        self.writer
+            .append(&LogRecord {
+                seq,
+                key: Bytes::from(key.to_vec()),
+                value: Bytes::from(value.to_vec()),
+                rec_type: LogRecordType::Normal,
+            })
+            .with_context(&self.path)?;
 
         Ok(())
     }
 
     /// Appends a Delete operation (Tombstone) to the WAL.
     pub fn append_delete(&mut self, key: &[u8], seq: u64) -> Result<(), WalError> {
-        self.writer.append(&LogRecord {
-            seq,
-            key: Bytes::from(key.to_vec()),
-            value: Bytes::new(),
-            rec_type: LogRecordType::Tombstone,
-        }).with_context(&self.path)?;
+        trace!(seq, key_len = key.len(), "Appending DELETE to WAL");
+
+        self.writer
+            .append(&LogRecord {
+                seq,
+                key: Bytes::from(key.to_vec()),
+                value: Bytes::new(),
+                rec_type: LogRecordType::Tombstone,
+            })
+            .with_context(&self.path)?;
 
         Ok(())
     }
@@ -233,11 +273,16 @@ impl Wal {
     /// This is typically called after the corresponding Memtable has been successfully flushed to SSTable.
     pub fn delete(dir: PathBuf, file_id: u64) -> Result<(), WalError> {
         let path = dir.join(format!("{:09}.wal", file_id));
+
+        info!(file_id, ?path, "Deleting WAL file");
+
         fs::remove_file(&path).with_context(&path)
     }
 
     /// Syncs all pending writes to the physical disk.
     pub fn sync(&mut self) -> Result<(), WalError> {
+        debug!(?self.path, "Syncing WAL to disk");
+
         self.writer.sync().with_context(&self.path)?;
         Ok(())
     }
@@ -252,16 +297,16 @@ mod tests {
     fn test_wal_create_and_append() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
-        
+
         let mut wal = Wal::create(dir_path.clone(), 1).unwrap();
-        
+
         let key = b"test_key";
         let val = b"test_value";
         let seq = 100;
 
         wal.append_put(key, val, seq).unwrap();
         wal.sync().unwrap();
-        
+
         // Verify file exists
         assert!(dir_path.join("000000001.wal").exists());
     }
@@ -326,7 +371,7 @@ mod tests {
 
         // Filter seq < 20
         let (records, _) = Wal::read_all_logs(dir_path.clone(), 20).unwrap();
-        
+
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].seq, 20);
         assert_eq!(records[1].seq, 30);
@@ -336,12 +381,12 @@ mod tests {
     fn test_wal_delete() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
-        
+
         // Create
         let _wal = Wal::create(dir_path.clone(), 1).unwrap();
         let file_path = dir_path.join("000000001.wal");
         assert!(file_path.exists());
-        
+
         // Delete
         Wal::delete(dir_path.clone(), 1).unwrap();
         assert!(!file_path.exists());
@@ -351,13 +396,13 @@ mod tests {
     fn test_tombstone_has_empty_value() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
-        
+
         {
             let mut wal = Wal::create(dir_path.clone(), 1).unwrap();
             wal.append_delete(b"deleted_key", 1).unwrap();
             wal.sync().unwrap();
         }
-        
+
         let (records, _) = Wal::read_all_logs(dir_path, 0).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].rec_type, LogRecordType::Tombstone);

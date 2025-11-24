@@ -21,8 +21,8 @@ Thumbs.db
 # Build artifacts
 *.wasm
 
-# Documentation (temporarily ignored)
+# Documentation
 /docs/
 
-# study (temporarily ignored)
+# study
 /study/

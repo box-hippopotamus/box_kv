@@ -1,8 +1,8 @@
+use bytes::Bytes;
+use std::cmp::{Ordering, min};
 use std::fmt;
 use std::fmt::{Debug, Formatter};
-use std::cmp::{min, Ordering};
 use std::mem::size_of;
-use bytes::Bytes;
 
 /// Maximum length of key to display in debug logs.
 const MAX_KEY_DEBUG_LEN: usize = 64;
@@ -44,9 +44,13 @@ impl Debug for ValueType {
                 // Truncate output to avoid flooding logs with large binary data
                 let debug_len = min(bytes.len(), MAX_VALUE_DEBUG_LEN);
 
-                write!(f, "Normal: len={}, {:?}", bytes.len(),
-                       &String::from_utf8_lossy(&bytes[..debug_len]))
-            },
+                write!(
+                    f,
+                    "Normal: len={}, {:?}",
+                    bytes.len(),
+                    &String::from_utf8_lossy(&bytes[..debug_len])
+                )
+            }
             Self::Tombstone => write!(f, "Tombstone"),
         }
     }
@@ -102,23 +106,31 @@ impl Entry {
     /// This includes the size of the key, value, and fixed-size metadata (seq + timestamp).
     /// It is primarily used for Memtable size calculations to trigger flush operations.
     pub fn estimated_size(&self) -> usize {
-        self.key.len() 
-        + self.value.len() 
-        + size_of::<u64>() // seq
-        + size_of::<u64>() // timestamp
+        self.key.len()
+            + self.value.len()
+            + size_of::<u64>() // seq
+            + size_of::<u64>() // timestamp
     }
-    
+
     /// Returns a reference to the key.
-    pub fn key(&self) -> &Bytes { &self.key }
-    
+    pub fn key(&self) -> &Bytes {
+        &self.key
+    }
+
     /// Returns a reference to the value type.
-    pub fn value(&self) -> &ValueType { &self.value }
-    
+    pub fn value(&self) -> &ValueType {
+        &self.value
+    }
+
     /// Returns the sequence number.
-    pub fn seq(&self) -> u64 { self.seq }
-    
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
     /// Returns the timestamp.
-    pub fn timestamp(&self) -> u64 { self.timestamp }
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
 }
 
 impl Debug for Entry {
@@ -178,9 +190,9 @@ mod tests {
         // Case 1: Same key, different seq. Newer seq (larger) should be smaller (come first).
         let e1_seq100 = Entry::new_normal(key1.clone(), Bytes::from("v1"), 100, 0);
         let e1_seq200 = Entry::new_normal(key1.clone(), Bytes::from("v2"), 200, 0);
-        
+
         // e1_seq200 (newer) < e1_seq100 (older) because we want newer items first in sort
-        assert_eq!(e1_seq200.cmp(&e1_seq100), Ordering::Less); 
+        assert_eq!(e1_seq200.cmp(&e1_seq100), Ordering::Less);
         assert!(e1_seq200 < e1_seq100);
 
         // Case 2: Different key. key1 < key2 (Ascending).
@@ -196,16 +208,16 @@ mod tests {
         ];
         entries.sort();
 
-        // Expected order: 
+        // Expected order:
         // 1. key1, seq 200 (Newer)
         // 2. key1, seq 100 (Older)
         // 3. key2, seq 300
         assert_eq!(entries[0].seq(), 200);
         assert_eq!(entries[0].key(), &key1);
-        
+
         assert_eq!(entries[1].seq(), 100);
         assert_eq!(entries[1].key(), &key1);
-        
+
         assert_eq!(entries[2].seq(), 300);
         assert_eq!(entries[2].key(), &key2);
     }
@@ -215,7 +227,7 @@ mod tests {
         let key = Bytes::from("key"); // 3 bytes
         let val = Bytes::from("value"); // 5 bytes
         let entry = Entry::new_normal(key, val, 1, 1);
-        
+
         // 3 + 5 + 8(seq) + 8(ts) = 24
         assert_eq!(entry.estimated_size(), 24);
 

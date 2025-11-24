@@ -1,6 +1,6 @@
 use serde::Deserialize;
-use thiserror::Error;
 use std::net::IpAddr;
+use thiserror::Error;
 
 /// Errors that can occur during server configuration validation.
 #[derive(Debug, Error)]
@@ -45,10 +45,11 @@ impl ServerConfig {
     }
 
     fn check_host(&self) -> Result<(), ServerConfigError> {
-        self.host.parse::<IpAddr>()
-        .map_err(|_| ServerConfigError::InvalidHost { 
-            host: self.host.clone() 
-        })?;
+        self.host
+            .parse::<IpAddr>()
+            .map_err(|_| ServerConfigError::InvalidHost {
+                host: self.host.clone(),
+            })?;
 
         Ok(())
     }

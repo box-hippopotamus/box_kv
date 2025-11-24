@@ -2,8 +2,12 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 
 use thiserror::Error;
+use tracing::warn;
 
-use super::{Bytes, LogRecord, LogRecordType, WAL_CRC_SIZE, WAL_HEADER_SIZE, WAL_KEY_LEN_SIZE, WAL_PAYLOAD_LEN_SIZE, WAL_TYPE_SIZE, WAL_VAL_LEN_SIZE};
+use super::{
+    Bytes, LogRecord, LogRecordType, WAL_CRC_SIZE, WAL_HEADER_SIZE, WAL_KEY_LEN_SIZE,
+    WAL_PAYLOAD_LEN_SIZE, WAL_TYPE_SIZE, WAL_VAL_LEN_SIZE,
+};
 
 // Safety limits to prevent OOM attacks from corrupted/malicious WAL files.
 // Adjust these values based on your system requirements.
@@ -23,7 +27,9 @@ pub enum ReadError {
     },
 
     /// The declared payload length does not match the sum of its components.
-    #[error("length mismatch: payload length ({payload_len}) does not equal field length ({field_len}) + key length ({key_len}) + value length ({val_len})")]
+    #[error(
+        "length mismatch: payload length ({payload_len}) does not equal field length ({field_len}) + key length ({key_len}) + value length ({val_len})"
+    )]
     LengthSumMismatch {
         payload_len: u64,
         field_len: u64,
@@ -36,7 +42,9 @@ pub enum ReadError {
     InvalidRecordType(u8),
 
     /// The key or value size exceeds the allowed limit.
-    #[error("Payload too large: key_len={key_len}, val_len={val_len} (max_key={max_key}, max_val={max_val})")]
+    #[error(
+        "Payload too large: key_len={key_len}, val_len={val_len} (max_key={max_key}, max_val={max_val})"
+    )]
     PayloadTooLarge {
         key_len: u64,
         val_len: u64,
@@ -79,11 +87,20 @@ impl WalIterator {
 
         // 2. Parse Header
         let header_crc = u32::from_be_bytes(header_buf[0..WAL_CRC_SIZE].try_into().unwrap());
-        let payload_len = u64::from_be_bytes(header_buf[WAL_CRC_SIZE..WAL_CRC_SIZE+WAL_PAYLOAD_LEN_SIZE].try_into().unwrap());
-        let rec_type_u8 = header_buf[WAL_CRC_SIZE+WAL_PAYLOAD_LEN_SIZE];
-        let seq = u64::from_be_bytes(header_buf[WAL_CRC_SIZE+WAL_PAYLOAD_LEN_SIZE+WAL_TYPE_SIZE..].try_into().unwrap());
+        let payload_len = u64::from_be_bytes(
+            header_buf[WAL_CRC_SIZE..WAL_CRC_SIZE + WAL_PAYLOAD_LEN_SIZE]
+                .try_into()
+                .unwrap(),
+        );
+        let rec_type_u8 = header_buf[WAL_CRC_SIZE + WAL_PAYLOAD_LEN_SIZE];
+        let seq = u64::from_be_bytes(
+            header_buf[WAL_CRC_SIZE + WAL_PAYLOAD_LEN_SIZE + WAL_TYPE_SIZE..]
+                .try_into()
+                .unwrap(),
+        );
 
-        let rec_type = LogRecordType::try_from(rec_type_u8).map_err(ReadError::InvalidRecordType)?;
+        let rec_type =
+            LogRecordType::try_from(rec_type_u8).map_err(ReadError::InvalidRecordType)?;
 
         // 3. Read Payload Metadata (Key Length & Value Length)
         const FIELDS_LEN_TOTAL_SIZE: usize = WAL_KEY_LEN_SIZE + WAL_VAL_LEN_SIZE;
@@ -99,11 +116,19 @@ impl WalIterator {
                 payload_len,
                 field_len: (WAL_KEY_LEN_SIZE + WAL_VAL_LEN_SIZE) as u64,
                 key_len,
-                val_len });
+                val_len,
+            });
         }
 
         // Validate Safety Limits
         if key_len > WAL_MAX_KEY_SIZE || val_len > WAL_MAX_VAL_SIZE {
+            warn!(
+                key_len,
+                val_len,
+                max_key = WAL_MAX_KEY_SIZE,
+                max_val = WAL_MAX_VAL_SIZE,
+                "Payload size exceeds safety limits"
+            );
             return Err(ReadError::PayloadTooLarge {
                 key_len,
                 val_len,
@@ -132,7 +157,16 @@ impl WalIterator {
 
         let calculate_crc = hasher.finalize();
         if calculate_crc != header_crc {
-            return Err(ReadError::CrcMismatch { expected: header_crc, actual: calculate_crc });
+            warn!(
+                expected = header_crc,
+                actual = calculate_crc,
+                seq,
+                "CRC checksum mismatch detected"
+            );
+            return Err(ReadError::CrcMismatch {
+                expected: header_crc,
+                actual: calculate_crc,
+            });
         }
 
         // 6. Return LogRecord
