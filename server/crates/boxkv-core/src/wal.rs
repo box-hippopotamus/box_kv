@@ -242,3 +242,125 @@ impl Wal {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_wal_create_and_append() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+        
+        let mut wal = Wal::create(dir_path.clone(), 1).unwrap();
+        
+        let key = b"test_key";
+        let val = b"test_value";
+        let seq = 100;
+
+        wal.append_put(key, val, seq).unwrap();
+        wal.sync().unwrap();
+        
+        // Verify file exists
+        assert!(dir_path.join("000000001.wal").exists());
+    }
+
+    #[test]
+    fn test_wal_read_all_logs() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+
+        // 1. Create WAL 1 and write some data
+        {
+            let mut wal1 = Wal::create(dir_path.clone(), 1).unwrap();
+            wal1.append_put(b"k1", b"v1", 1).unwrap();
+            wal1.append_put(b"k2", b"v2", 2).unwrap();
+            wal1.sync().unwrap();
+        }
+
+        // 2. Create WAL 2 and write more data
+        {
+            let mut wal2 = Wal::create(dir_path.clone(), 2).unwrap();
+            wal2.append_put(b"k3", b"v3", 3).unwrap();
+            wal2.append_delete(b"k1", 4).unwrap();
+            wal2.sync().unwrap();
+        }
+
+        // 3. Read all logs
+        let (records, max_seq) = Wal::read_all_logs(dir_path.clone(), 0).unwrap();
+
+        assert_eq!(max_seq, 4);
+        assert_eq!(records.len(), 4);
+
+        // Verify order and content
+        assert_eq!(records[0].seq, 1);
+        assert_eq!(records[0].key.as_ref(), b"k1");
+        assert_eq!(records[0].value.as_ref(), b"v1");
+        assert_eq!(records[0].rec_type, LogRecordType::Normal);
+
+        assert_eq!(records[1].seq, 2);
+        assert_eq!(records[1].key.as_ref(), b"k2");
+
+        assert_eq!(records[2].seq, 3);
+        assert_eq!(records[2].key.as_ref(), b"k3");
+
+        assert_eq!(records[3].seq, 4);
+        assert_eq!(records[3].key.as_ref(), b"k1");
+        assert_eq!(records[3].rec_type, LogRecordType::Tombstone);
+        assert!(records[3].value.is_empty());
+    }
+
+    #[test]
+    fn test_wal_min_seq_filtering() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+
+        {
+            let mut wal = Wal::create(dir_path.clone(), 1).unwrap();
+            wal.append_put(b"k1", b"v1", 10).unwrap();
+            wal.append_put(b"k2", b"v2", 20).unwrap();
+            wal.append_put(b"k3", b"v3", 30).unwrap();
+            wal.sync().unwrap();
+        }
+
+        // Filter seq < 20
+        let (records, _) = Wal::read_all_logs(dir_path.clone(), 20).unwrap();
+        
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].seq, 20);
+        assert_eq!(records[1].seq, 30);
+    }
+
+    #[test]
+    fn test_wal_delete() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+        
+        // Create
+        let _wal = Wal::create(dir_path.clone(), 1).unwrap();
+        let file_path = dir_path.join("000000001.wal");
+        assert!(file_path.exists());
+        
+        // Delete
+        Wal::delete(dir_path.clone(), 1).unwrap();
+        assert!(!file_path.exists());
+    }
+
+    #[test]
+    fn test_tombstone_has_empty_value() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+        
+        {
+            let mut wal = Wal::create(dir_path.clone(), 1).unwrap();
+            wal.append_delete(b"deleted_key", 1).unwrap();
+            wal.sync().unwrap();
+        }
+        
+        let (records, _) = Wal::read_all_logs(dir_path, 0).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].rec_type, LogRecordType::Tombstone);
+        assert!(records[0].value.is_empty());
+    }
+}
