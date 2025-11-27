@@ -9,30 +9,93 @@ const MAX_KEY_DEBUG_LEN: usize = 64;
 /// Maximum length of value to display in debug logs.
 const MAX_VALUE_DEBUG_LEN: usize = 64;
 
+/// Type tags for serialization/deserialization in WAL and SSTable formats.
+pub const NORMAL_VALUE_TYPE: u8 = 0;
+pub const TOMBSTONE_VALUE_TYPE: u8 = 1;
+pub const EXPIRING_VALUE_TYPE: u8 = 2;
+
 /// Represents the type of value stored in an LSM-tree entry.
 ///
-/// - `Normal`: Represents a standard key-value pair (Put operation).
-/// - `Tombstone`: Represents a deletion marker (Delete operation).
-#[derive(Clone)]
+/// # Variants
+/// - `Normal`: A standard key-value pair (PUT operation).
+/// - `Tombstone`: A deletion marker (DELETE operation). No actual data is stored.
+/// - `Expiring`: A value with an expiration timestamp (TTL support).
+///
+/// # Serialization
+/// Each variant has a unique type tag for wire format encoding:
+/// - Normal = 0
+/// - Tombstone = 1
+/// - Expiring = 2
+#[derive(Clone, PartialEq)]
+#[repr(u8)]
 pub enum ValueType {
-    /// A standard value containing raw bytes.
-    Normal(Bytes),
-    /// A marker indicating the key has been deleted.
-    Tombstone,
+    /// Standard value containing raw bytes.
+    Normal(Bytes) = NORMAL_VALUE_TYPE,
+
+    /// Deletion marker. Indicates the key has been deleted but not yet compacted.
+    Tombstone = TOMBSTONE_VALUE_TYPE,
+
+    /// Value with TTL. Contains both data and an expiration timestamp (Unix epoch seconds).
+    Expiring {
+        data: Bytes,
+        expire_at: u64, // Unix timestamp in seconds
+    } = EXPIRING_VALUE_TYPE,
 }
 
+const VALUE_TOMBSTONE_LEN: usize = 0;
+const VALUE_EXPIRING_AT_LEN: usize = size_of::<u64>();
+
 impl ValueType {
-    /// Returns the length of the underlying value in bytes.
-    /// Returns 0 for Tombstones.
-    fn len(&self) -> usize {
+    /// Returns the type tag for serialization.
+    ///
+    /// Used in WAL and SSTable formats to identify the variant during deserialization.
+    pub fn type_tag(&self) -> u8 {
         match self {
-            Self::Normal(bytes) => bytes.len(),
-            Self::Tombstone => 0,
+            ValueType::Normal(_) => NORMAL_VALUE_TYPE,
+            ValueType::Tombstone => TOMBSTONE_VALUE_TYPE,
+            ValueType::Expiring { .. } => EXPIRING_VALUE_TYPE,
         }
     }
 
-    /// Checks if the value type is a Tombstone.
-    fn is_tombstone(&self) -> bool {
+    /// Returns the total serialized length (data + metadata).
+    ///
+    /// This is the number of bytes occupied in the WAL/SSTable payload section
+    /// for this value, excluding the type tag.
+    ///
+    /// # Examples
+    /// - Normal("hello") → 5 bytes
+    /// - Tombstone → 0 bytes
+    /// - Expiring { data: "hello", expire_at: 123 } → 13 bytes (8 + 5)
+    pub fn serialized_len(&self) -> usize {
+        self.data_len() + self.meta_len()
+    }
+
+    /// Returns the length of the user data in bytes.
+    ///
+    /// For Tombstone, this is always 0.
+    pub fn data_len(&self) -> usize {
+        match self {
+            ValueType::Normal(bytes) => bytes.len(),
+            ValueType::Tombstone => VALUE_TOMBSTONE_LEN,
+            ValueType::Expiring { data, .. } => data.len(),
+        }
+    }
+
+    /// Returns the length of metadata in bytes (excluding the user data).
+    ///
+    /// - Normal: 0 (no metadata)
+    /// - Tombstone: 0 (no metadata)
+    /// - Expiring: 8 (expire_at timestamp)
+    pub fn meta_len(&self) -> usize {
+        match self {
+            ValueType::Normal(_) => 0,
+            ValueType::Tombstone => 0,
+            ValueType::Expiring { .. } => VALUE_EXPIRING_AT_LEN,
+        }
+    }
+
+    /// Checks if this value represents a deletion marker.
+    pub fn is_tombstone(&self) -> bool {
         matches!(self, ValueType::Tombstone)
     }
 }
@@ -41,75 +104,117 @@ impl Debug for ValueType {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Normal(bytes) => {
-                // Truncate output to avoid flooding logs with large binary data
                 let debug_len = min(bytes.len(), MAX_VALUE_DEBUG_LEN);
-
                 write!(
                     f,
-                    "Normal: len={}, {:?}",
+                    "Normal(len={}, data={:?})",
                     bytes.len(),
                     &String::from_utf8_lossy(&bytes[..debug_len])
                 )
             }
             Self::Tombstone => write!(f, "Tombstone"),
+            Self::Expiring { data, expire_at } => {
+                let debug_len = min(data.len(), MAX_VALUE_DEBUG_LEN);
+                write!(
+                    f,
+                    "Expiring(expire_at={}, len={}, data={:?})",
+                    expire_at,
+                    data.len(),
+                    &String::from_utf8_lossy(&data[..debug_len])
+                )
+            }
         }
     }
 }
 
-/// Represents an atomic record in the storage engine.
+/// Represents a single versioned record in the LSM-tree.
 ///
-/// An `Entry` consists of a key, a value (or tombstone), a sequence number,
-/// and a timestamp.
+/// An `Entry` is the fundamental unit of data stored in the engine. It consists of:
+/// - A key (arbitrary bytes)
+/// - A value (Normal data, Tombstone, or Expiring value)
+/// - A sequence number (monotonically increasing, used for MVCC)
 ///
-/// # Ordering
+/// # Ordering Semantics
 /// Entries are ordered by:
-/// 1. Key (Ascending)
-/// 2. Sequence Number (Descending) - Newer versions appear first.
+/// 1. **Key** (Ascending) - Primary sort key
+/// 2. **Sequence Number** (Descending) - Newer versions appear first
 ///
-/// This ordering is critical for LSM-tree lookups to find the latest version efficiently.
+/// This ordering is critical for LSM-tree operations:
+/// - During compaction, newer versions shadow older ones
+/// - Point queries can stop at the first match (latest version)
+/// - Range scans naturally iterate over the latest versions
+///
+/// # Examples
+/// ```ignore
+/// let e1 = Entry::new_normal(100, key.clone(), value1);
+/// let e2 = Entry::new_normal(200, key.clone(), value2);
+///
+/// assert!(e2 < e1); // seq=200 comes before seq=100
+/// ```
 #[derive(Clone)]
 pub struct Entry {
     key: Bytes,
-    value: ValueType,
+    val: ValueType,
     seq: u64,
-    timestamp: u64,
 }
 
+const ENTRY_SEQ_LEN: usize = size_of::<u64>();
+
 impl Entry {
-    /// Private constructor for internal use.
-    fn new(key: Bytes, value: ValueType, seq: u64, timestamp: u64) -> Self {
-        Self {
-            key,
-            value,
-            seq,
-            timestamp,
-        }
-    }
-
-    /// Creates a new deletion marker entry (Tombstone).
-    pub fn new_tombstone(key: Bytes, seq: u64, timestamp: u64) -> Self {
-        Self::new(key, ValueType::Tombstone, seq, timestamp)
-    }
-
-    /// Creates a new standard value entry.
-    pub fn new_normal(key: Bytes, value: Bytes, seq: u64, timestamp: u64) -> Self {
-        Self::new(key, ValueType::Normal(value), seq, timestamp)
-    }
-
-    /// Checks if this entry represents a deletion.
-    pub fn is_tombstone(&self) -> bool {
-        self.value.is_tombstone()
-    }
-
-    /// Returns the estimated memory size of this entry.
+    /// Creates a new entry with the given sequence number, key, and value type.
     ///
-    /// This includes the size of the key, value, and fixed-size metadata (seq + timestamp).
-    /// It is primarily used for Memtable size calculations to trigger flush operations.
+    /// This is the internal constructor. Use `new_normal`, `new_tombstone`, or
+    /// `new_expiring` for specific value types.
+    pub fn new(seq: u64, key: Bytes, val: ValueType) -> Self {
+        Self { key, val, seq }
+    }
+
+    /// Creates a deletion marker entry (Tombstone).
+    ///
+    /// Tombstones are used to mark deleted keys in the LSM-tree. They are
+    /// removed during compaction when they are the oldest version of a key.
+    pub fn new_tombstone(seq: u64, key: Bytes) -> Self {
+        Self::new(seq, key, ValueType::Tombstone)
+    }
+
+    /// Creates a standard value entry (Normal).
+    pub fn new_normal(seq: u64, key: Bytes, val: Bytes) -> Self {
+        Self::new(seq, key, ValueType::Normal(val))
+    }
+
+    /// Creates an expiring value entry with TTL.
+    ///
+    /// # Arguments
+    /// * `seq` - Sequence number
+    /// * `key` - Key bytes
+    /// * `val` - Value bytes
+    /// * `expire_at` - Unix timestamp (seconds) when this entry expires
+    pub fn new_expiring(seq: u64, key: Bytes, val: Bytes, expire_at: u64) -> Self {
+        Self::new(
+            seq,
+            key,
+            ValueType::Expiring {
+                data: val,
+                expire_at,
+            },
+        )
+    }
+
+    /// Returns `true` if this entry is a deletion marker.
+    pub fn is_tombstone(&self) -> bool {
+        self.val.is_tombstone()
+    }
+
+    /// Returns the estimated memory size of this entry in bytes.
+    ///
+    /// This includes:
+    /// - Key length
+    /// - Value serialized length (data + metadata)
+    /// - Sequence number (8 bytes)
+    ///
+    /// Used primarily for Memtable size calculations to trigger flush operations.
     pub fn estimated_size(&self) -> usize {
-        self.key.len()
-            + self.value.len()
-            + size_of::<u64>() // seq
-            + size_of::<u64>() // timestamp
+        self.key.len() + self.val.serialized_len() + ENTRY_SEQ_LEN
     }
 
     /// Returns a reference to the key.
@@ -118,18 +223,13 @@ impl Entry {
     }
 
     /// Returns a reference to the value type.
-    pub fn value(&self) -> &ValueType {
-        &self.value
+    pub fn val(&self) -> &ValueType {
+        &self.val
     }
 
     /// Returns the sequence number.
     pub fn seq(&self) -> u64 {
         self.seq
-    }
-
-    /// Returns the timestamp.
-    pub fn timestamp(&self) -> u64 {
-        self.timestamp
     }
 }
 
@@ -140,9 +240,8 @@ impl Debug for Entry {
 
         f.debug_struct("Entry")
             .field("key", &String::from_utf8_lossy(&self.key[..debug_len]))
-            .field("value", &self.value)
+            .field("val", &self.val)
             .field("seq", &self.seq)
-            .field("timestamp", &self.timestamp)
             .finish()
     }
 }
@@ -187,16 +286,16 @@ mod tests {
         let key1 = Bytes::from("key1");
         let key2 = Bytes::from("key2");
 
-        // Case 1: Same key, different seq. Newer seq (larger) should be smaller (come first).
-        let e1_seq100 = Entry::new_normal(key1.clone(), Bytes::from("v1"), 100, 0);
-        let e1_seq200 = Entry::new_normal(key1.clone(), Bytes::from("v2"), 200, 0);
+        // Case 1: Same key, different seq. Newer seq (larger) should come first.
+        let e1_seq100 = Entry::new_normal(100, key1.clone(), Bytes::from("v1"));
+        let e1_seq200 = Entry::new_normal(200, key1.clone(), Bytes::from("v2"));
 
         // e1_seq200 (newer) < e1_seq100 (older) because we want newer items first in sort
         assert_eq!(e1_seq200.cmp(&e1_seq100), Ordering::Less);
         assert!(e1_seq200 < e1_seq100);
 
         // Case 2: Different key. key1 < key2 (Ascending).
-        let e2_seq300 = Entry::new_normal(key2.clone(), Bytes::from("v3"), 300, 0);
+        let e2_seq300 = Entry::new_normal(300, key2.clone(), Bytes::from("v3"));
         assert_eq!(e1_seq200.cmp(&e2_seq300), Ordering::Less);
         assert!(e1_seq200 < e2_seq300);
 
@@ -226,14 +325,14 @@ mod tests {
     fn test_entry_size() {
         let key = Bytes::from("key"); // 3 bytes
         let val = Bytes::from("value"); // 5 bytes
-        let entry = Entry::new_normal(key, val, 1, 1);
+        let entry = Entry::new_normal(1, key, val);
 
-        // 3 + 5 + 8(seq) + 8(ts) = 24
-        assert_eq!(entry.estimated_size(), 24);
+        // 3 (key) + 5 (value) + 8 (seq) = 16
+        assert_eq!(entry.estimated_size(), 16);
 
-        let tombstone = Entry::new_tombstone(Bytes::from("key"), 1, 1);
-        // 3 + 0 + 8 + 8 = 19
-        assert_eq!(tombstone.estimated_size(), 19);
+        let tombstone = Entry::new_tombstone(1, Bytes::from("key"));
+        // 3 (key) + 0 (tombstone) + 8 (seq) = 11
+        assert_eq!(tombstone.estimated_size(), 11);
     }
 
     #[test]
@@ -242,13 +341,13 @@ mod tests {
         let val1 = Bytes::from("val1");
         let val2 = Bytes::from("val2");
 
-        let e1 = Entry::new_normal(key.clone(), val1, 100, 0);
-        let e2 = Entry::new_normal(key.clone(), val2, 100, 1); // timestamp/value differ, but seq/key same
+        let e1 = Entry::new_normal(100, key.clone(), val1);
+        let e2 = Entry::new_normal(100, key.clone(), val2); // Same key+seq, different value
 
-        // In LSM, same key+seq means same entry. Value/TS should be ignored in Eq.
+        // In LSM, same key+seq means same entry. Value should be ignored in equality.
         assert_eq!(e1, e2);
 
-        let e3 = Entry::new_normal(key.clone(), Bytes::from("val1"), 101, 0);
+        let e3 = Entry::new_normal(101, key.clone(), Bytes::from("val1"));
         assert_ne!(e1, e3); // Different seq
     }
 }

@@ -1,13 +1,14 @@
 use std::fs::File;
 use std::io::{BufReader, Read};
-
 use thiserror::Error;
 use tracing::warn;
 
 use super::{
-    Bytes, LogRecord, LogRecordType, WAL_CRC_SIZE, WAL_HEADER_SIZE, WAL_KEY_LEN_SIZE,
-    WAL_PAYLOAD_LEN_SIZE, WAL_TYPE_SIZE, WAL_VAL_LEN_SIZE,
+    Bytes, WAL_CRC_SIZE, WAL_EXPIRE_LEN_SIZE, WAL_HEADER_SIZE, WAL_KEY_LEN_SIZE,
+    WAL_PAYLOAD_LEN_SIZE, WAL_TYPE_SIZE,
 };
+
+use boxkv_common::types::{EXPIRING_VALUE_TYPE, Entry, NORMAL_VALUE_TYPE, TOMBSTONE_VALUE_TYPE};
 
 // Safety limits to prevent OOM attacks from corrupted/malicious WAL files.
 // Adjust these values based on your system requirements.
@@ -26,17 +27,6 @@ pub enum ReadError {
         actual: u32,   // The actual CRC value calculated from the payload.
     },
 
-    /// The declared payload length does not match the sum of its components.
-    #[error(
-        "length mismatch: payload length ({payload_len}) does not equal field length ({field_len}) + key length ({key_len}) + value length ({val_len})"
-    )]
-    LengthSumMismatch {
-        payload_len: u64,
-        field_len: u64,
-        key_len: u64,
-        val_len: u64,
-    },
-
     /// Encountered an unknown or invalid record type byte.
     #[error("Invalid record type: {0}")]
     InvalidRecordType(u8),
@@ -53,12 +43,16 @@ pub enum ReadError {
     },
 }
 
-/// An iterator over `LogRecord`s in a WAL file.
+/// Iterator over `Entry` records in a WAL file.
+///
+/// Reads and deserializes entries sequentially from the WAL binary format.
+/// Uses `BufReader` for efficient I/O.
 pub struct WalIterator {
     reader: BufReader<File>,
 }
 
 impl WalIterator {
+    /// Creates a new iterator from an open file handle.
     pub fn new(file: File) -> Self {
         Self {
             reader: BufReader::new(file),
@@ -67,13 +61,18 @@ impl WalIterator {
 }
 
 impl WalIterator {
-    /// Reads the next record from the log.
+    /// Reads and deserializes the next entry from the WAL.
     ///
-    /// Returns:
-    /// - `Ok(None)`: Reached legitimate End of File (EOF).
-    /// - `Ok(Some(record))`: Successfully read a record.
-    /// - `Err(e)`: Encountered a corruption or I/O error.
-    fn read_next_record(&mut self) -> Result<Option<LogRecord>, ReadError> {
+    /// # Returns
+    /// - `Ok(None)`: Clean EOF reached (no more records)
+    /// - `Ok(Some(Entry))`: Successfully read and validated entry
+    /// - `Err(ReadError)`: Corruption, I/O error, or validation failure
+    ///
+    /// # Error Handling
+    /// - Partial reads at EOF are treated as truncation (expected during crash)
+    /// - CRC mismatches indicate data corruption
+    /// - Oversized keys/values are rejected to prevent OOM attacks
+    fn read_next_entry(&mut self) -> Result<Option<Entry>, ReadError> {
         // 1. Read Header
         let mut header_buf = [0u8; WAL_HEADER_SIZE];
         // Attempt to read the fixed-size header.
@@ -92,33 +91,24 @@ impl WalIterator {
                 .try_into()
                 .unwrap(),
         );
-        let rec_type_u8 = header_buf[WAL_CRC_SIZE + WAL_PAYLOAD_LEN_SIZE];
+        let val_type_u8 = header_buf[WAL_CRC_SIZE + WAL_PAYLOAD_LEN_SIZE];
         let seq = u64::from_be_bytes(
             header_buf[WAL_CRC_SIZE + WAL_PAYLOAD_LEN_SIZE + WAL_TYPE_SIZE..]
                 .try_into()
                 .unwrap(),
         );
 
-        let rec_type =
-            LogRecordType::try_from(rec_type_u8).map_err(ReadError::InvalidRecordType)?;
+        // 3. (Key Length & Key Data)
+        let mut key_len_buf = [0u8; WAL_KEY_LEN_SIZE];
+        self.reader.read_exact(&mut key_len_buf)?;
+        let key_len = u64::from_be_bytes(key_len_buf);
 
-        // 3. Read Payload Metadata (Key Length & Value Length)
-        const FIELDS_LEN_TOTAL_SIZE: usize = WAL_KEY_LEN_SIZE + WAL_VAL_LEN_SIZE;
-        let mut field_len_buf = [0u8; FIELDS_LEN_TOTAL_SIZE];
-        self.reader.read_exact(&mut field_len_buf)?;
+        let mut key_buf = vec![0u8; key_len as usize];
+        self.reader.read_exact(&mut key_buf)?;
 
-        let key_len = u64::from_be_bytes(field_len_buf[0..WAL_KEY_LEN_SIZE].try_into().unwrap());
-        let val_len = u64::from_be_bytes(field_len_buf[WAL_KEY_LEN_SIZE..].try_into().unwrap());
-
-        // Validate consistency between Payload Length and its components
-        if payload_len != (WAL_KEY_LEN_SIZE + WAL_VAL_LEN_SIZE) as u64 + key_len + val_len {
-            return Err(ReadError::LengthSumMismatch {
-                payload_len,
-                field_len: (WAL_KEY_LEN_SIZE + WAL_VAL_LEN_SIZE) as u64,
-                key_len,
-                val_len,
-            });
-        }
+        // Calculate value section length
+        // payload_len = KeyLen(8B) + Key + Value Section
+        let val_len = payload_len - WAL_KEY_LEN_SIZE as u64 - key_len;
 
         // Validate Safety Limits
         if key_len > WAL_MAX_KEY_SIZE || val_len > WAL_MAX_VAL_SIZE {
@@ -137,21 +127,17 @@ impl WalIterator {
             });
         }
 
-        // 4. Read Variable-Length Payload (Key & Value)
-        let mut key_buf = vec![0u8; key_len as usize];
+        // 4. Value
         let mut val_buf = vec![0u8; val_len as usize];
-
-        self.reader.read_exact(&mut key_buf)?;
         self.reader.read_exact(&mut val_buf)?;
 
         // 5. Verify CRC
         // Reconstruct the CRC calculation to verify data integrity.
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&payload_len.to_be_bytes());
-        hasher.update(&[rec_type_u8]);
+        hasher.update(&[val_type_u8]);
         hasher.update(&seq.to_be_bytes());
         hasher.update(&key_len.to_be_bytes());
-        hasher.update(&val_len.to_be_bytes());
         hasher.update(&key_buf);
         hasher.update(&val_buf);
 
@@ -169,22 +155,30 @@ impl WalIterator {
             });
         }
 
-        // 6. Return LogRecord
-        Ok(Some(LogRecord {
-            seq,
-            key: Bytes::from(key_buf),
-            value: Bytes::from(val_buf),
-            rec_type,
-        }))
+        let key = Bytes::from(key_buf);
+        match val_type_u8 {
+            NORMAL_VALUE_TYPE => {
+                let data = Bytes::from(val_buf);
+                Ok(Some(Entry::new_normal(seq, key, data)))
+            }
+            TOMBSTONE_VALUE_TYPE => Ok(Some(Entry::new_tombstone(seq, key))),
+            EXPIRING_VALUE_TYPE => {
+                let expire_at =
+                    u64::from_be_bytes(val_buf[..WAL_EXPIRE_LEN_SIZE].try_into().unwrap());
+                let data = Bytes::from(val_buf).slice(WAL_EXPIRE_LEN_SIZE..);
+                Ok(Some(Entry::new_expiring(seq, key, data, expire_at)))
+            }
+            _ => Err(ReadError::InvalidRecordType(val_type_u8)),
+        }
     }
 }
 
 impl Iterator for WalIterator {
-    type Item = Result<LogRecord, ReadError>;
+    type Item = Result<Entry, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.read_next_record() {
-            Ok(Some(record)) => Some(Ok(record)),
+        match self.read_next_entry() {
+            Ok(Some(entry)) => Some(Ok(entry)),
             Ok(None) => None,
             Err(e) => Some(Err(e)),
         }
