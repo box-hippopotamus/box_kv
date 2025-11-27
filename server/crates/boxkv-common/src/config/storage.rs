@@ -105,7 +105,6 @@ impl StorageConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn test_default_values() {
@@ -116,28 +115,26 @@ mod tests {
 
     #[test]
     fn test_valid_memtable_size() {
-        let test_dir = PathBuf::from("./test_data_valid");
-        fs::remove_dir_all(&test_dir).ok();
+        let temp_dir = tempfile::tempdir().unwrap();
 
         let config = StorageConfig {
-            data_dir: test_dir.clone(),
+            data_dir: temp_dir.path().to_path_buf(),
             memtable_size_mb: 64,
         };
 
         let result = config.validate();
-
-        // Cleanup
-        fs::remove_dir_all(&test_dir).ok();
-
         assert!(result.is_ok(), "Validation failed: {:?}", result.err());
     }
 
     #[test]
     fn test_invalid_memtable_size_zero() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
         let config = StorageConfig {
-            data_dir: PathBuf::from("./test_data_invalid"),
+            data_dir: temp_dir.path().to_path_buf(),
             memtable_size_mb: 0,
         };
+
         let result = config.validate();
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -150,17 +147,14 @@ mod tests {
 
     #[test]
     fn test_invalid_memtable_size_too_large() {
-        let test_dir = PathBuf::from("./test_data_large");
-        fs::remove_dir_all(&test_dir).ok();
+        let temp_dir = tempfile::tempdir().unwrap();
 
         let config = StorageConfig {
-            data_dir: test_dir.clone(),
+            data_dir: temp_dir.path().to_path_buf(),
             memtable_size_mb: 2048,
         };
+
         let result = config.validate();
-
-        fs::remove_dir_all(&test_dir).ok();
-
         assert!(result.is_err(), "Expected error for size 2048, but got Ok");
         match result.unwrap_err() {
             StorageConfigError::InvalidMemtableSize { size } => {
@@ -173,92 +167,68 @@ mod tests {
     #[test]
     fn test_memtable_size_boundary_values() {
         // min valid value
-        let test_dir_1 = PathBuf::from("./test_boundary_1");
-        fs::remove_dir_all(&test_dir_1).ok();
-
+        let temp_dir_1 = tempfile::tempdir().unwrap();
         let config = StorageConfig {
-            data_dir: test_dir_1.clone(),
+            data_dir: temp_dir_1.path().to_path_buf(),
             memtable_size_mb: 1,
         };
         let result = config.validate();
-        fs::remove_dir_all(&test_dir_1).ok();
         assert!(result.is_ok(), "Size 1 should be valid");
 
-        //max valid value
-        let test_dir_1024 = PathBuf::from("./test_boundary_1024");
-        fs::remove_dir_all(&test_dir_1024).ok();
-
+        // max valid value
+        let temp_dir_1024 = tempfile::tempdir().unwrap();
         let config = StorageConfig {
-            data_dir: test_dir_1024.clone(),
+            data_dir: temp_dir_1024.path().to_path_buf(),
             memtable_size_mb: 1024,
         };
         let result = config.validate();
-        fs::remove_dir_all(&test_dir_1024).ok();
         assert!(result.is_ok(), "Size 1024 should be valid");
 
         // below min
-        let test_dir_0 = PathBuf::from("./test_boundary_0");
-        fs::remove_dir_all(&test_dir_0).ok();
-
+        let temp_dir_0 = tempfile::tempdir().unwrap();
         let config = StorageConfig {
-            data_dir: test_dir_0.clone(),
+            data_dir: temp_dir_0.path().to_path_buf(),
             memtable_size_mb: 0,
         };
         let result = config.validate();
-        fs::remove_dir_all(&test_dir_0).ok();
         assert!(result.is_err(), "Size 0 should be invalid");
 
         // above max
-        let test_dir_1025 = PathBuf::from("./test_boundary_1025");
-        fs::remove_dir_all(&test_dir_1025).ok();
-
+        let temp_dir_1025 = tempfile::tempdir().unwrap();
         let config = StorageConfig {
-            data_dir: test_dir_1025.clone(),
+            data_dir: temp_dir_1025.path().to_path_buf(),
             memtable_size_mb: 1025,
         };
         let result = config.validate();
-        fs::remove_dir_all(&test_dir_1025).ok();
         assert!(result.is_err(), "Size 1025 should be invalid");
     }
 
     #[test]
     fn test_data_dir_creation() {
-        let test_dir = PathBuf::from("./test_data_creation");
-
-        // Ensure directory does not exist
-        fs::remove_dir_all(&test_dir).ok();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_path = temp_dir.path().join("subdir");
 
         let config = StorageConfig {
-            data_dir: test_dir.clone(),
+            data_dir: test_path.clone(),
             memtable_size_mb: 64,
         };
 
         // Should succeed and create directory
         let result = config.validate();
         assert!(result.is_ok(), "Validation failed: {:?}", result.err());
-        assert!(test_dir.exists(), "Directory was not created");
-
-        // Cleanup
-        fs::remove_dir_all(&test_dir).ok();
+        assert!(test_path.exists(), "Directory was not created");
     }
 
     #[test]
     fn test_data_dir_writable() {
-        let test_dir = PathBuf::from("./test_data_writable");
-        fs::remove_dir_all(&test_dir).ok();
-        fs::create_dir_all(&test_dir).expect("Failed to create test directory");
+        let temp_dir = tempfile::tempdir().unwrap();
 
         let config = StorageConfig {
-            data_dir: test_dir.clone(),
+            data_dir: temp_dir.path().to_path_buf(),
             memtable_size_mb: 64,
         };
 
-        // Should succeed
         let result = config.validate();
-
-        // Cleanup
-        fs::remove_dir_all(&test_dir).ok();
-
         assert!(result.is_ok(), "Validation failed: {:?}", result.err());
     }
 

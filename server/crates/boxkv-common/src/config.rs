@@ -149,37 +149,9 @@ const ENV_VAR_CONFIG_FILE: &str = "BOXKV_CONFIG";
 const DEFAULT_CONFIG_PATH: &str = "./config.toml";
 
 #[cfg(test)]
-/// Tests in this module manipulate process-level environment variables (std::env)
-/// and the filesystem. Running them in parallel (cargo test's default behavior)
-/// causes race conditions, file locking errors (especially on Windows), and
-/// environment variable pollution.
-///
-/// Run these tests sequentially:
-/// `cargo test --package boxkv-common -- --test-threads=1`
 mod tests {
     use super::*;
     use std::fs;
-
-    fn create_test_config_file(path: &str, content: &str) -> PathBuf {
-        let path = PathBuf::from(path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).expect("Failed to create directory");
-        }
-        fs::write(&path, content.as_bytes()).expect("Failed to write file");
-        path
-    }
-
-    fn cleanup_test_files(paths: &[&str]) {
-        for path in paths {
-            fs::remove_file(path).ok();
-            let path_buf = PathBuf::from(path);
-            if let Some(parent) = path_buf.parent() {
-                if parent.to_string_lossy().contains("test_configs") {
-                    fs::remove_dir_all(parent).ok();
-                }
-            }
-        }
-    }
 
     #[test]
     fn test_find_config_file_none() {
@@ -187,10 +159,23 @@ mod tests {
             env::remove_var(ENV_VAR_CONFIG_FILE);
         }
 
-        let default_path = DEFAULT_CONFIG_PATH;
-        fs::remove_file(default_path).ok();
+        // Save and remove default config if exists
+        let default_path = PathBuf::from(DEFAULT_CONFIG_PATH);
+        let backup = if default_path.exists() {
+            let content = fs::read(&default_path).ok();
+            fs::remove_file(&default_path).ok();
+            content
+        } else {
+            None
+        };
 
         let result = Config::find_config_file();
+
+        // Restore default config if it existed
+        if let Some(content) = backup {
+            fs::write(&default_path, content).ok();
+        }
+
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
@@ -201,21 +186,34 @@ mod tests {
             env::remove_var(ENV_VAR_CONFIG_FILE);
         }
 
-        let config_path = DEFAULT_CONFIG_PATH;
-        fs::remove_file(config_path).ok();
+        let config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
 
-        create_test_config_file(config_path, "[storage]\ndata_dir = \"./data\"\n");
+        // Backup existing config
+        let backup = if config_path.exists() {
+            let content = fs::read(&config_path).ok();
+            fs::remove_file(&config_path).ok();
+            content
+        } else {
+            None
+        };
+
+        // Create test config
+        fs::write(&config_path, "[storage]\ndata_dir = \"./data\"\n").unwrap();
 
         let result = Config::find_config_file();
 
-        fs::remove_file(config_path).ok();
+        // Cleanup and restore
+        fs::remove_file(&config_path).ok();
+        if let Some(content) = backup {
+            fs::write(&config_path, content).ok();
+        }
 
         assert!(
             result.is_ok(),
             "find_config_file failed: {:?}",
             result.err()
         );
-        assert_eq!(result.unwrap(), Some(PathBuf::from(config_path)));
+        assert_eq!(result.unwrap(), Some(config_path));
     }
 
     #[test]
@@ -224,13 +222,10 @@ mod tests {
             env::remove_var(ENV_VAR_CONFIG_FILE);
         }
 
-        let test_dir = "./test_configs_env_exists";
-        let test_config = format!("{}/env_test.toml", test_dir);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_config = temp_dir.path().join("env_test.toml");
 
-        fs::remove_file(&test_config).ok();
-        fs::remove_dir_all(test_dir).ok();
-
-        create_test_config_file(&test_config, "[storage]\ndata_dir = \"./data\"\n");
+        fs::write(&test_config, "[storage]\ndata_dir = \"./data\"\n").unwrap();
 
         unsafe {
             env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
@@ -242,11 +237,8 @@ mod tests {
             env::remove_var(ENV_VAR_CONFIG_FILE);
         }
 
-        fs::remove_file(&test_config).ok();
-        fs::remove_dir_all(test_dir).ok();
-
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Some(PathBuf::from(test_config.as_str())));
+        assert_eq!(result.unwrap(), Some(test_config));
     }
 
     #[test]
@@ -255,9 +247,11 @@ mod tests {
             env::remove_var(ENV_VAR_CONFIG_FILE);
         }
 
-        let non_existent = "./test_configs/non_existent.toml";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let non_existent = temp_dir.path().join("non_existent.toml");
+
         unsafe {
-            env::set_var(ENV_VAR_CONFIG_FILE, non_existent);
+            env::set_var(ENV_VAR_CONFIG_FILE, &non_existent);
         }
 
         let result = Config::find_config_file();
@@ -270,7 +264,7 @@ mod tests {
 
         match result.unwrap_err() {
             ConfigError::FileNotFound { path } => {
-                assert_eq!(path, PathBuf::from(non_existent));
+                assert_eq!(path, non_existent);
             }
             _ => panic!("Expected FileNotFound error"),
         }
@@ -282,17 +276,24 @@ mod tests {
             env::remove_var(ENV_VAR_CONFIG_FILE);
         }
 
-        let env_config = "./test_configs_priority/env_priority.toml";
-        let default_config = "./config_priority.toml";
-        fs::remove_file(env_config).ok();
-        fs::remove_file(default_config).ok();
-        fs::remove_dir_all("./test_configs_priority").ok();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let env_config = temp_dir.path().join("env_priority.toml");
+        let default_config = PathBuf::from(DEFAULT_CONFIG_PATH);
 
-        create_test_config_file(env_config, "[storage]\nmemtable_size_mb = 128\n");
-        create_test_config_file(default_config, "[storage]\nmemtable_size_mb = 64\n");
+        // Backup default config
+        let backup = if default_config.exists() {
+            let content = fs::read(&default_config).ok();
+            fs::remove_file(&default_config).ok();
+            content
+        } else {
+            None
+        };
+
+        fs::write(&env_config, "[storage]\nmemtable_size_mb = 128\n").unwrap();
+        fs::write(&default_config, "[storage]\nmemtable_size_mb = 64\n").unwrap();
 
         unsafe {
-            env::set_var(ENV_VAR_CONFIG_FILE, env_config);
+            env::set_var(ENV_VAR_CONFIG_FILE, &env_config);
         }
 
         let result = Config::find_config_file();
@@ -301,12 +302,14 @@ mod tests {
             env::remove_var(ENV_VAR_CONFIG_FILE);
         }
 
-        fs::remove_file(env_config).ok();
-        fs::remove_file(default_config).ok();
-        fs::remove_dir_all("./test_configs_priority").ok();
+        // Cleanup default config and restore
+        fs::remove_file(&default_config).ok();
+        if let Some(content) = backup {
+            fs::write(&default_config, content).ok();
+        }
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Some(PathBuf::from(env_config)));
+        assert_eq!(result.unwrap(), Some(env_config));
     }
 
     #[test]
@@ -329,10 +332,12 @@ mod tests {
             env::remove_var(ENV_VAR_CONFIG_FILE);
         }
 
-        let test_data_dir = "./test_data_default";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_data_dir = temp_dir.path().join("data");
+        let test_config = temp_dir.path().join("default_test.toml");
 
-        fs::remove_dir_all("./test_configs_default").ok();
-        fs::remove_dir_all(test_data_dir).ok();
+        // Use forward slashes for TOML compatibility (works on both Windows and Unix)
+        let data_dir_str = test_data_dir.display().to_string().replace('\\', "/");
 
         let config_content = format!(
             r#"
@@ -343,13 +348,13 @@ data_dir = "{}"
 host = "127.0.0.1"
 port = 21524
 "#,
-            test_data_dir
+            data_dir_str
         );
 
-        let test_config = "./test_configs_default/default_test.toml";
-        create_test_config_file(test_config, &config_content);
+        fs::write(&test_config, config_content).unwrap();
+
         unsafe {
-            env::set_var(ENV_VAR_CONFIG_FILE, test_config);
+            env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
         }
 
         let result = Config::load();
@@ -360,13 +365,9 @@ port = 21524
 
         assert!(result.is_ok(), "Config load failed: {:?}", result.err());
         let config = result.unwrap();
-        assert_eq!(config.storage.data_dir, PathBuf::from(test_data_dir));
+        assert_eq!(config.storage.data_dir, test_data_dir);
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 21524);
-
-        fs::remove_file(test_config).ok();
-        fs::remove_dir_all("./test_configs_default").ok();
-        fs::remove_dir_all(test_data_dir).ok();
     }
 
     #[test]
@@ -375,11 +376,12 @@ port = 21524
             env::remove_var(ENV_VAR_CONFIG_FILE);
         }
 
-        let test_dir = "./test_configs_custom";
-        let data_dir = "./test_data_custom";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        let test_config = temp_dir.path().join("custom_test.toml");
 
-        fs::remove_dir_all(test_dir).ok();
-        fs::remove_dir_all(data_dir).ok();
+        // Use forward slashes for TOML compatibility (works on both Windows and Unix)
+        let data_dir_str = data_dir.display().to_string().replace('\\', "/");
 
         let config_content = format!(
             r#"
@@ -391,11 +393,10 @@ memtable_size_mb = 128
 host = "0.0.0.0"
 port = 8080
 "#,
-            data_dir
+            data_dir_str
         );
 
-        let test_config = format!("{}/custom_test.toml", test_dir);
-        create_test_config_file(&test_config, &config_content);
+        fs::write(&test_config, config_content).unwrap();
 
         unsafe {
             env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
@@ -409,14 +410,10 @@ port = 8080
 
         assert!(result.is_ok(), "Config load failed: {:?}", result.err());
         let config = result.unwrap();
-        assert_eq!(config.storage.data_dir, PathBuf::from(data_dir));
+        assert_eq!(config.storage.data_dir, data_dir);
         assert_eq!(config.storage.memtable_size_mb, 128);
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 8080);
-
-        fs::remove_file(&test_config).ok();
-        fs::remove_dir_all(test_dir).ok();
-        fs::remove_dir_all(data_dir).ok();
     }
 
     #[test]
@@ -425,11 +422,8 @@ port = 8080
             env::remove_var(ENV_VAR_CONFIG_FILE);
         }
 
-        let test_dir = "./test_configs_fail_storage";
-        let data_dir = "./test_data_fail_storage";
-
-        fs::remove_dir_all(test_dir).ok();
-        fs::remove_dir_all(data_dir).ok();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_config = temp_dir.path().join("validation_fail_storage.toml");
 
         let config_content = r#"
 [storage]
@@ -440,8 +434,7 @@ host = "127.0.0.1"
 port = 8080
 "#;
 
-        let test_config = format!("{}/validation_fail_storage.toml", test_dir);
-        create_test_config_file(&test_config, config_content);
+        fs::write(&test_config, config_content).unwrap();
 
         unsafe {
             env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
@@ -452,10 +445,6 @@ port = 8080
         unsafe {
             env::remove_var(ENV_VAR_CONFIG_FILE);
         }
-
-        fs::remove_file(&test_config).ok();
-        fs::remove_dir_all(test_dir).ok();
-        fs::remove_dir_all(data_dir).ok();
 
         assert!(result.is_err(), "Expected error but got Ok");
         match result.unwrap_err() {
@@ -470,11 +459,12 @@ port = 8080
             env::remove_var(ENV_VAR_CONFIG_FILE);
         }
 
-        let test_dir = "./test_configs_fail_server";
-        let data_dir = "./test_data_fail_server";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path().join("data");
+        let test_config = temp_dir.path().join("validation_fail_server.toml");
 
-        fs::remove_dir_all(test_dir).ok();
-        fs::remove_dir_all(data_dir).ok();
+        // Use forward slashes for TOML compatibility (works on both Windows and Unix)
+        let data_dir_str = data_dir.display().to_string().replace('\\', "/");
 
         let config_content = format!(
             r#"
@@ -486,11 +476,10 @@ memtable_size_mb = 64
 host = "invalid-host"
 port = 8080
 "#,
-            data_dir
+            data_dir_str
         );
 
-        let test_config = format!("{}/validation_fail_server.toml", test_dir);
-        create_test_config_file(&test_config, &config_content);
+        fs::write(&test_config, config_content).unwrap();
 
         unsafe {
             env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
@@ -501,10 +490,6 @@ port = 8080
         unsafe {
             env::remove_var(ENV_VAR_CONFIG_FILE);
         }
-
-        fs::remove_file(&test_config).ok();
-        fs::remove_dir_all(test_dir).ok();
-        fs::remove_dir_all(data_dir).ok();
 
         assert!(result.is_err(), "Expected error but got Ok");
         match result.unwrap_err() {
@@ -519,16 +504,16 @@ port = 8080
             env::remove_var(ENV_VAR_CONFIG_FILE);
         }
 
-        let test_dir = "./test_configs_parse_error";
-        fs::remove_dir_all(test_dir).ok();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_config = temp_dir.path().join("parse_error_test.toml");
 
         let config_content = r#"
 [storage]
 memtable_size_mb = "not_a_number"
 "#;
 
-        let test_config = format!("{}/parse_error_test.toml", test_dir);
-        create_test_config_file(&test_config, config_content);
+        fs::write(&test_config, config_content).unwrap();
+
         unsafe {
             env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
         }
@@ -538,9 +523,6 @@ memtable_size_mb = "not_a_number"
         unsafe {
             env::remove_var(ENV_VAR_CONFIG_FILE);
         }
-
-        fs::remove_file(&test_config).ok();
-        fs::remove_dir_all(test_dir).ok();
 
         assert!(result.is_err());
         match result.unwrap_err() {
