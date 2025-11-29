@@ -202,7 +202,7 @@ impl Wal {
         debug!(file_count = wal_files.len(), "Scanned WAL files");
 
         let mut max_seq = u64::MIN;
-        let mut all_entrise = Vec::new();
+        let mut all_entries = Vec::new();
 
         // 3. Iterate through each file and read records
         for (file_id, path) in &wal_files {
@@ -215,7 +215,7 @@ impl Wal {
                     Ok(entry) => {
                         if entry.seq() >= min_seq {
                             max_seq = max_seq.max(entry.seq());
-                            all_entrise.push(entry);
+                            all_entries.push(entry);
                             entry_count += 1;
                         }
                     }
@@ -245,17 +245,17 @@ impl Wal {
         // 4. Final sort by sequence number
         // This handles potential out-of-order writes if multiple threads allocated Seqs
         // but wrote to the WAL in a slightly different physical order.
-        all_entrise.sort_by_key(|r| r.seq());
+        all_entries.sort_by_key(|r| r.seq());
 
         let elapsed = start.elapsed();
         info!(
-            record_count = all_entrise.len(),
+            record_count = all_entries.len(),
             max_seq,
             elapsed_ms = elapsed.as_millis(),
             "WAL recovery completed"
         );
 
-        Ok((all_entrise, max_seq))
+        Ok((all_entries, max_seq))
     }
 
     /// Appends a PUT operation to the WAL.
