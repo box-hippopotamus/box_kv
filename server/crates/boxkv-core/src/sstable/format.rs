@@ -254,7 +254,7 @@ impl Footer {
         let (meta_index_handle, meta_read) = BlockHandle::decode(data)?;
         let (index_handle, _index_read) = BlockHandle::decode(&data[meta_read..])?;
 
-        // 安全地提取 magic bytes
+        // Safely extract magic bytes from the end of the footer
         let magic_bytes: [u8; MAGIC_SIZE] =
             data[FOOTER_SIZE - MAGIC_SIZE..].try_into().map_err(|_| {
                 SSTableError::Corrupted(format!(
