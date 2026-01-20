@@ -1,6 +1,58 @@
 [package]
 name = "boxkv-server"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "boxkv_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "boxkv-server"
+path = "src/main.rs"
 
 [dependencies]
+# 内部依赖
+boxkv-core = { path = "../boxkv-core" }
+boxkv-common = { path = "../boxkv-common" }
+boxkv-wasm = { path = "../boxkv-wasm" }
+boxkv-executor = { path = "../boxkv-executor" }
+boxkv-storage = { path = "../boxkv-storage" }
+
+# gRPC 框架
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+
+# 健康检查与反射
+tonic-health = "0.12"
+tonic-reflection = "0.12"
+
+# 异步运行时
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+async-stream = "0.3"
+
+# 日志与追踪
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# 序列化
+bytes = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tempfile = { workspace = true }
+
+# 错误处理
+thiserror = { workspace = true }
+
+# 工具
+uuid = { version = "1.11", features = ["v4", "v5", "serde"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tempfile = { workspace = true }

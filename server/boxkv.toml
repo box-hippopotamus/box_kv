@@ -1,0 +1,571 @@
+# BoxKV Configuration File
+# ======================================================================
+# This is the default configuration file for BoxKV Key-Value Database.
+# All values shown here are the defaults used if not specified.
+# 
+# Configuration loading priority:
+#   1. Environment Variables (highest)
+#   2. TOML Configuration File
+#   3. Built-in Defaults (lowest)
+#
+# To override a setting via environment variable, use the prefix "BOXKV_"
+# followed by the section and key in SNAKE_CASE.
+# Example: BOXKV_SERVER_PORT=8080
+# ======================================================================
+
+# ======================================================================
+# Server Configuration
+# ======================================================================
+[server]
+# Network host address to bind to
+# Default: "0.0.0.0" (binds to all available network interfaces)
+# Environment: BOXKV_SERVER_HOST
+host = "0.0.0.0"
+
+# TCP port to listen on
+# Default: 21542
+# Range: 1-65535
+# Environment: BOXKV_SERVER_PORT
+port = 21542
+
+# Number of worker threads for handling requests
+# Default: number of CPU cores
+# Recommendation: Set to number of CPU cores for optimal performance
+# Environment: BOXKV_SERVER_WORKERS
+workers = 8
+
+# Maximum number of concurrent client connections
+# Default: 10000
+# Increase for high-concurrency scenarios
+# Environment: BOXKV_SERVER_MAX_CONNECTIONS
+max_connections = 10000
+
+# Request timeout in milliseconds
+# Default: 30000 (30 seconds)
+# Requests exceeding this timeout will be aborted
+# Environment: BOXKV_SERVER_REQUEST_TIMEOUT_MS
+request_timeout_ms = 30000
+
+# Directory for log files
+# Default: "./logs"
+# Logs include server operations, errors, and debug information
+# Environment: BOXKV_SERVER_LOG_DIR
+log_dir = "./logs"
+
+# Prefix for log file names
+# Default: "boxkv"
+# Log files will be named like "boxkv-2024-01-01.log"
+# Environment: BOXKV_SERVER_LOG_FILE_PREFIX
+log_file_prefix = "boxkv"
+
+# ======================================================================
+# Storage Configuration
+# ======================================================================
+[storage]
+# Main data directory for SSTable files and metadata
+# Default: "./data"
+# This directory stores the persistent LSM-Tree data
+# Environment: BOXKV_STORAGE_DATA_DIR
+data_dir = "./data"
+
+# Write-Ahead Log (WAL) directory
+# Default: "./data/wal"
+# Separate WAL directory can improve I/O performance
+# Environment: BOXKV_STORAGE_WAL_DIR
+wal_dir = "./data/wal"
+
+# Memtable size in megabytes
+# Default: 64 MB
+# When a memtable reaches this size, it triggers a flush to disk
+# Larger values reduce write amplification but increase memory usage
+# Environment: BOXKV_STORAGE_MEMTABLE_SIZE_MB
+memtable_size_mb = 64
+
+# Maximum number of write buffers (memtables)
+# Default: 3
+# Includes 1 active memtable + N immutable memtables waiting to flush
+# Larger values allow more write throughput but use more memory
+# Environment: BOXKV_STORAGE_MAX_WRITE_BUFFER_NUMBER
+max_write_buffer_number = 3
+
+# WAL synchronization mode
+# Options: "None", "Sync", "Periodic"
+# - None: No explicit sync, relies on OS buffering (fastest, least durable)
+# - Sync: Sync after every write (slowest, most durable)
+# - Periodic: Sync every N milliseconds (balanced)
+# Default: "Sync"
+# Environment: BOXKV_STORAGE_WAL_SYNC_MODE
+wal_sync_mode = "Sync"
+
+# Block cache size in megabytes
+# Default: 512 MB
+# Caches frequently accessed data blocks in memory
+# Larger values improve read performance for hot data
+# Environment: BOXKV_STORAGE_BLOCK_CACHE_SIZE_MB
+block_cache_size_mb = 512
+
+# Create database directory if it doesn't exist
+# Default: true
+# Set to false to fail if the directory is missing
+# Environment: BOXKV_STORAGE_CREATE_IF_MISSING
+create_if_missing = true
+
+# Return error if database already exists
+# Default: false
+# Useful for ensuring a fresh database is created
+# Environment: BOXKV_STORAGE_ERROR_IF_EXISTS
+error_if_exists = false
+
+# Manifest block size in bytes
+# Default: 32 KB
+# Manifest stores metadata about SSTable files
+# Environment: BOXKV_STORAGE_MANIFEST_BLOCK_SIZE_BYTES
+manifest_block_size_bytes = 32768
+
+# Maximum manifest file size in bytes
+# Default: 128 MB
+# When exceeded, a new manifest file is created
+# Environment: BOXKV_STORAGE_MANIFEST_MAX_FILE_SIZE_BYTES
+manifest_max_file_size_bytes = 134217728
+
+# Maximum key size in WAL in bytes
+# Default: 1 MB
+# Keys larger than this will be rejected
+# Environment: BOXKV_STORAGE_WAL_MAX_KEY_SIZE_BYTES
+wal_max_key_size_bytes = 1048576
+
+# Maximum value size in WAL in bytes
+# Default: 64 MB
+# Values larger than this will be rejected
+# Environment: BOXKV_STORAGE_WAL_MAX_VALUE_SIZE_BYTES
+wal_max_value_size_bytes = 67108864
+
+# Table cache capacity (number of open SSTable files)
+# Default: 1024
+# Keeping more SSTables open improves read performance
+# Environment: BOXKV_STORAGE_TABLE_CACHE_CAPACITY_TABLES
+table_cache_capacity_tables = 1024
+
+# File write buffer size in bytes
+# Default: 64 KB
+# Buffering file writes improves I/O performance
+# Environment: BOXKV_STORAGE_FILE_WRITE_BUFFER_SIZE_BYTES
+file_write_buffer_size_bytes = 65536
+
+# ======================================================================
+# Compaction Configuration
+# ======================================================================
+[compaction]
+# Maximum number of LSM-Tree levels (including L0)
+# Default: 7 (L0 to L6)
+# More levels allow higher write throughput but increase read latency
+# Environment: BOXKV_COMPACTION_MAX_LEVELS
+max_levels = 7
+
+# L0 file count trigger for compaction
+# Default: 4
+# When L0 has this many files, L0→L1 compaction is triggered
+# Lower values reduce read amplification, higher values reduce write amplification
+# Environment: BOXKV_COMPACTION_LEVEL0_TRIGGER
+level0_trigger = 4
+
+# Level size multiplier
+# Default: 10
+# Size of level K ≈ (level 1 size) × multiplier^(K-1)
+# Higher values create larger level size gaps
+# Environment: BOXKV_COMPACTION_LEVEL_SIZE_MULTIPLIER
+level_size_multiplier = 10
+
+# Target size of L1 in megabytes
+# Default: 256 MB
+# This is the base size; other levels scale exponentially
+# Environment: BOXKV_COMPACTION_LEVEL1_SIZE_MB
+level1_size_mb = 256
+
+# Target SSTable file size in megabytes
+# Default: 64 MB
+# Smaller files allow finer-grained compaction but increase file count
+# Environment: BOXKV_COMPACTION_TARGET_FILE_SIZE_BASE_MB
+target_file_size_base_mb = 64
+
+# Maximum concurrent background compaction jobs
+# Default: 2
+# More jobs increase write throughput but use more CPU and I/O
+# Recommendation: 1-2 for HDDs, 2-4 for SSDs
+# Environment: BOXKV_COMPACTION_MAX_BACKGROUND_JOBS
+max_background_jobs = 2
+
+# Maximum subcompaction parallelism
+# Default: 1 (no subcompaction splitting)
+# Values > 1 split large compactions into smaller parallel tasks
+# Environment: BOXKV_COMPACTION_MAX_SUBCOMPACTIONS
+max_subcompactions = 1
+
+# Soft backpressure threshold for pending compaction bytes
+# Default: 64 GB
+# Slows down writes when pending compaction exceeds this
+# Environment: BOXKV_COMPACTION_SOFT_PENDING_COMPACTION_BYTES
+soft_pending_compaction_bytes = 68719476736
+
+# Hard backpressure threshold for pending compaction bytes
+# Default: 256 GB
+# Stops writes when pending compaction exceeds this
+# Environment: BOXKV_COMPACTION_HARD_PENDING_COMPACTION_BYTES
+hard_pending_compaction_bytes = 274877906944
+
+# ======================================================================
+# SSTable Configuration
+# ======================================================================
+[sstable]
+# Data block size in bytes
+# Default: 4 KB
+# Smaller blocks reduce read amplification, larger blocks improve compression
+# Environment: BOXKV_SSTABLE_BLOCK_SIZE
+block_size = 4096
+
+# Restart interval for prefix compression
+# Default: 16
+# Number of keys between restart points in a data block
+# Lower values enable faster seek but reduce compression ratio
+# Environment: BOXKV_SSTABLE_RESTART_INTERVAL
+restart_interval = 16
+
+# Metadata block size in bytes
+# Default: 4 KB
+# Size of index and filter blocks
+# Environment: BOXKV_SSTABLE_METADATA_BLOCK_SIZE
+metadata_block_size = 4096
+
+# Compression algorithm
+# Options: "None", "Snappy", "Lz4", "Zstd"
+# Default: "None"
+# Compression reduces disk usage but increases CPU overhead
+# Recommendation: "Lz4" for balanced performance, "Zstd" for best compression
+# Environment: BOXKV_SSTABLE_COMPRESSION
+compression = "None"
+
+# Enable index block compression
+# Default: false
+# Compresses index blocks to save memory and disk space
+# Environment: BOXKV_SSTABLE_ENABLE_INDEX_COMPRESSION
+enable_index_compression = false
+
+# Enable bloom filter
+# Default: true
+# Bloom filters reduce false positive lookups
+# Disable only if memory is extremely constrained
+# Environment: BOXKV_SSTABLE_FILTER_ENABLED
+filter_enabled = true
+
+# Filter block type
+# Options: "Full", "Partitioned"
+# - Full: Single large filter per SSTable (faster, uses more memory)
+# - Partitioned: Filters split into partitions (memory-efficient)
+# Default: "Full"
+# Environment: BOXKV_SSTABLE_FILTER_BLOCK_TYPE
+filter_block_type = "Full"
+
+# Filter policy
+# Options: "FixedBloom", "FixedRibbon", "LevelBased"
+# - FixedBloom: Fast bloom filter (balanced)
+# - FixedRibbon: Space-efficient ribbon filter (slower, smaller)
+# - LevelBased: Bloom for lower levels, Ribbon for higher levels
+# Default: "FixedBloom"
+# Environment: BOXKV_SSTABLE_FILTER_POLICY
+filter_policy = "FixedBloom"
+
+# Bloom filter false positive rate
+# Default: 0.01 (1%)
+# Lower values reduce false positives but increase filter size
+# Range: 0.0 to 1.0
+# Environment: BOXKV_SSTABLE_BLOOM_FALSE_POSITIVE_RATE
+bloom_false_positive_rate = 0.01
+
+# Filter bits per key
+# Default: 10
+# Higher values reduce false positive rate but increase filter size
+# Recommendation: 10 for 1% FP rate, 14 for 0.1% FP rate
+# Environment: BOXKV_SSTABLE_FILTER_BITS_PER_KEY
+filter_bits_per_key = 10
+
+# Bloom filter enabled before level N
+# Default: 3
+# Bloom filters are used for levels 0 to N-1
+# Higher levels may use ribbon filters or no filters
+# Environment: BOXKV_SSTABLE_FILTER_BLOOM_BEFORE_LEVEL
+filter_bloom_before_level = 3
+
+# Filter index restart interval (for partitioned filters)
+# Default: 16
+# Number of keys between restart points in filter index block
+# Environment: BOXKV_SSTABLE_FILTER_INDEX_RESTART_INTERVAL
+filter_index_restart_interval = 16
+
+# Verify block checksums on read
+# Default: true
+# Detects data corruption but adds CPU overhead
+# Disable only for maximum performance in trusted environments
+# Environment: BOXKV_SSTABLE_VERIFY_CHECKSUMS
+verify_checksums = true
+
+# Maximum key size in bytes
+# Default: 1 MB
+# Keys exceeding this size will be rejected
+# Environment: BOXKV_SSTABLE_MAX_KEY_SIZE_BYTES
+max_key_size_bytes = 1048576
+
+# Maximum value size in bytes
+# Default: 64 MB
+# Values exceeding this size will be rejected
+# Environment: BOXKV_SSTABLE_MAX_VALUE_SIZE_BYTES
+max_value_size_bytes = 67108864
+
+# Maximum block size in bytes
+# Default: 4 MB
+# Individual blocks cannot exceed this size
+# Environment: BOXKV_SSTABLE_MAX_BLOCK_SIZE_BYTES
+max_block_size_bytes = 4194304
+
+# Enable prefetching of data blocks
+# Default: true
+# Prefetching improves sequential read performance
+# Environment: BOXKV_SSTABLE_ENABLE_PREFETCH
+enable_prefetch = true
+
+# Prefetch index and filter blocks on open
+# Default: true
+# Loads index and filter blocks into cache when SSTable is opened
+# Improves read latency but increases startup time
+# Environment: BOXKV_SSTABLE_PREFETCH_INDEX_AND_FILTER
+prefetch_index_and_filter = true
+
+# ======================================================================
+# WASM Plugin Configuration
+# ======================================================================
+[wasm]
+# Enable WASM plugin system
+# Default: false
+# Set to true to enable custom WASM plugins for hooks
+# Environment: BOXKV_WASM_ENABLED
+enabled = true
+
+# Plugin Service Configuration
+[wasm.plugin]
+# Directory for plugin blob files (.wasm modules)
+# Default: "./data/plugins/blobs"
+# Environment: BOXKV_WASM_PLUGIN_BLOBS_PATH
+blobs_path = "./data/plugins/blobs"
+
+# Directory for plugin registry metadata
+# Default: "./data/plugins/registry"
+# Environment: BOXKV_WASM_PLUGIN_REGISTRY_PATH
+registry_path = "./data/plugins/registry"
+
+# Plugin IDs to prewarm on startup
+# Default: [] (empty list)
+# Example: ["plugin-abc", "plugin-xyz"]
+# Prewarming loads plugins into memory before first use
+# Environment: BOXKV_WASM_PLUGIN_PREWARM_ON_START
+prewarm_on_start = []
+
+# Maximum plugin module size in megabytes
+# Default: 16 MB
+# Modules exceeding this size will be rejected during upload
+# Environment: BOXKV_WASM_PLUGIN_MAX_MODULE_SIZE_MB
+max_module_size_mb = 16
+
+# Enable validation during plugin upload
+# Default: true
+# Validates WASM module format and safety before accepting upload
+# Environment: BOXKV_WASM_PLUGIN_UPLOAD_VALIDATION_ENABLED
+upload_validation_enabled = true
+
+# WASM Runtime Configuration
+[wasm.runtime]
+# Epoch ticker interval in milliseconds
+# Default: 10 ms
+# Controls the granularity of timeout enforcement
+# Lower values improve timeout accuracy but add overhead
+# Environment: BOXKV_WASM_RUNTIME_EPOCH_TICK_MS
+epoch_tick_ms = 10
+
+# WASM Budget Configuration (Resource Limits)
+[wasm.runtime.budget]
+# Maximum fuel (CPU quota) per WASM call
+# Default: 10,000,000
+# Fuel prevents infinite loops and excessive CPU usage
+# Higher values allow more computation per call
+# Environment: BOXKV_WASM_MAX_FUEL
+max_fuel = 10000000
+
+# Timeout per WASM call in milliseconds
+# Default: 1000 (1 second)
+# Calls exceeding this timeout will be terminated
+# Environment: BOXKV_WASM_TIMEOUT_MS
+timeout_ms = 1000
+
+# Maximum memory per WASM instance in bytes
+# Default: 64 MB
+# WASM modules cannot allocate more than this amount
+# Environment: BOXKV_WASM_MAX_MEMORY_BYTES
+max_memory_bytes = 67108864
+
+# Maximum number of KV get operations per WASM call
+# Default: 100
+# Prevents excessive database reads within a single plugin call
+# Environment: BOXKV_WASM_MAX_KV_GET_COUNT
+max_kv_get_count = 100
+
+# Maximum total bytes read from KV store per WASM call
+# Default: 10 MB
+# Limits total data transfer from database to WASM
+# Environment: BOXKV_WASM_MAX_BYTES_READ_TOTAL
+max_bytes_read_total = 10485760
+
+# WASM Instance Pool Configuration
+[wasm.runtime.pool]
+# Maximum instances per plugin
+# Default: 10
+# Pooling instances reduces initialization overhead
+# Higher values support more concurrent calls per plugin
+# Environment: BOXKV_WASM_POOL_MAX_INSTANCES_PER_PLUGIN
+max_instances_per_plugin = 10
+
+# Instance idle timeout in seconds
+# Default: 180 (3 minutes)
+# Idle instances are evicted after this duration
+# Environment: BOXKV_WASM_POOL_IDLE_TIMEOUT_SECS
+idle_timeout_secs = 180
+
+# WASM Module Cache Configuration
+[wasm.runtime.cache]
+# Maximum cached compiled modules
+# Default: 100
+# Caching compiled modules speeds up instance creation
+# Higher values use more memory
+# Environment: BOXKV_WASM_CACHE_MAX_MODULES
+max_modules = 100
+
+# Enable compilation cache persistence
+# Default: true
+# Saves compiled modules to disk for faster restarts
+# Environment: BOXKV_WASM_CACHE_ENABLE_COMPILATION_CACHE
+enable_compilation_cache = true
+
+# ======================================================================
+# Limits Configuration
+# ======================================================================
+[limits]
+# Maximum key size in kilobytes
+# Default: 64 KB
+# Keys larger than this will be rejected by the API
+# Environment: BOXKV_LIMITS_MAX_KEY_SIZE_KB
+max_key_size_kb = 64
+
+# Maximum value size in megabytes
+# Default: 64 MB
+# Values larger than this will be rejected by the API
+# Environment: BOXKV_LIMITS_MAX_VALUE_SIZE_MB
+max_value_size_mb = 64
+
+# Maximum batch operation size
+# Default: 10000
+# Limits the number of operations in a single batch request
+# Environment: BOXKV_LIMITS_MAX_BATCH_SIZE
+max_batch_size = 10000
+
+# Maximum scan/range query limit
+# Default: 10000
+# Limits the number of results returned by a single scan operation
+# Environment: BOXKV_LIMITS_MAX_SCAN_LIMIT
+max_scan_limit = 10000
+
+# ======================================================================
+# Executor Configuration (Task Scheduling)
+# ======================================================================
+[executor]
+# Maximum worker threads
+# Default: min(CPU cores, 16)
+# Controls the size of the background task thread pool
+# Environment: BOXKV_EXECUTOR_MAX_WORKER_THREADS
+max_worker_threads = 16
+
+# Medium-priority task thread ratio
+# Default: 0.5 (50%)
+# Percentage of threads allocated to medium-priority tasks (compaction)
+# Range: 0.0 to 1.0
+# Environment: BOXKV_EXECUTOR_MEDIUM_TASK_RATIO
+medium_task_ratio = 0.5
+
+# Task queue capacity
+# Default: 1024
+# Maximum pending tasks in the scheduler queue
+# Environment: BOXKV_EXECUTOR_TASK_QUEUE_CAPACITY
+task_queue_capacity = 1024
+
+# Deficit Round-Robin (DRR) quantum for critical priority
+# Default: 8
+# Higher values give critical tasks more CPU time per round
+# Environment: BOXKV_EXECUTOR_QUANTUM_CRITICAL
+quantum_critical = 8
+
+# DRR quantum for high priority
+# Default: 4
+# Environment: BOXKV_EXECUTOR_QUANTUM_HIGH
+quantum_high = 4
+
+# DRR quantum for medium priority
+# Default: 1
+# Environment: BOXKV_EXECUTOR_QUANTUM_MEDIUM
+quantum_medium = 1
+
+# Cost calculation unit in bytes
+# Default: 4096 (4 KB)
+# Task cost is calculated based on data size divided by this unit
+# Environment: BOXKV_EXECUTOR_COST_UNIT_BYTES
+cost_unit_bytes = 4096
+
+# Minimum task cost
+# Default: 1
+# No task has a cost lower than this value
+# Environment: BOXKV_EXECUTOR_MIN_COST
+min_cost = 1
+
+# Maximum task cost
+# Default: 100000
+# Tasks with cost exceeding this are capped
+# Environment: BOXKV_EXECUTOR_MAX_COST
+max_cost = 100000
+
+# Write operation cost weight multiplier
+# Default: 10
+# Write operations are weighted higher than reads
+# Environment: BOXKV_EXECUTOR_COST_WRITE_WEIGHT
+cost_write_weight = 10
+
+# Read operation cost weight multiplier
+# Default: 1
+# Environment: BOXKV_EXECUTOR_COST_READ_WEIGHT
+cost_read_weight = 1
+
+# EWMA (Exponentially Weighted Moving Average) initial value in bytes
+# Default: 4096 (4 KB)
+# Used for predicting task costs
+# Environment: BOXKV_EXECUTOR_EWMA_INITIAL_VALUE_BYTES
+ewma_initial_value_bytes = 4096
+
+# EWMA clamp minimum value in bytes
+# Default: 4096 (4 KB)
+# Predicted costs are clamped to this minimum
+# Environment: BOXKV_EXECUTOR_EWMA_CLAMP_MIN_BYTES
+ewma_clamp_min_bytes = 4096
+
+# EWMA clamp maximum value in bytes
+# Default: 1048576 (1 MB)
+# Predicted costs are clamped to this maximum
+# Environment: BOXKV_EXECUTOR_EWMA_CLAMP_MAX_BYTES
+ewma_clamp_max_bytes = 1048576
+
+# ======================================================================
+# End of Configuration
+# ======================================================================

@@ -1,6 +1,57 @@
 [package]
 name = "boxkv-wasm"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
 
 [dependencies]
+# 核心依赖
+tracing = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+
+# WASM 运行时
+wasmtime = "40.0"
+wasmtime-wasi = "40.0"
+wasmparser = "0.219"
+
+# 异步运行时
+tokio = { workspace = true, features = ["full"] }
+
+# 数据结构
+parking_lot = "0.12"
+dashmap = "6.1"
+slab = "0.4"
+
+# 序列化
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0"
+
+# 加密哈希
+sha2 = "0.10"
+
+# 内部依赖
+boxkv-core = { path = "../boxkv-core" }
+boxkv-common = { path = "../boxkv-common" }
+boxkv-storage = { path = "../boxkv-storage" }
+
+# 指标
+prometheus = { version = "0.14.0", features = ["process"] }
+
+# 工具
+chrono = "0.4"
+uuid = { version = "1.11", features = ["v4", "v5", "serde"] }
+wat = "1.219"
+hex = "0.4"
+walkdir = "2.5"
+
+moka = { version = "0.12", features = ["sync"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+criterion = "0.5"
+boxkv-executor = { path = "../boxkv-executor" }
+
+[features]
+default = []

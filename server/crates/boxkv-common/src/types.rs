@@ -1,31 +1,46 @@
-use bytes::Bytes;
+use crate::codec::{DecodeWithContext, Encode};
+use bytes::{BufMut, Bytes};
 use std::cmp::{Ordering, min};
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::mem::size_of;
+use thiserror::Error;
 
-/// Maximum length of key to display in debug logs.
+/// ValueType 编解码专属错误类型
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ValueTypeError {
+    /// 未知的类型标签
+    #[error("unknown value type tag: {0}")]
+    UnknownTypeTag(u8),
+
+    /// 缓冲区太短，无法解码
+    #[error("buffer too short: expected at least {expected} bytes, got {actual}")]
+    BufferTooShort { expected: usize, actual: usize },
+
+    /// 数据格式无效
+    #[error("invalid data format: {0}")]
+    InvalidFormat(String),
+}
+
+/// 调试日志中 key 字符串展示的最大长度
+#[allow(dead_code)]
 const MAX_KEY_DEBUG_LEN: usize = 64;
-/// Maximum length of value to display in debug logs.
+/// 调试日志中 value 字符串展示的最大长度
+#[allow(dead_code)]
 const MAX_VALUE_DEBUG_LEN: usize = 64;
 
-/// Type tags for serialization/deserialization in WAL and SSTable formats.
+/// 在 WAL 与 SSTable 编解码中的类型标签
 pub const NORMAL_VALUE_TYPE: u8 = 0;
 pub const TOMBSTONE_VALUE_TYPE: u8 = 1;
 pub const EXPIRING_VALUE_TYPE: u8 = 2;
 
-/// Represents the type of value stored in an LSM-tree entry.
+/// LSM 条目中值的类型
 ///
-/// # Variants
-/// - `Normal`: A standard key-value pair (PUT operation).
-/// - `Tombstone`: A deletion marker (DELETE operation). No actual data is stored.
-/// - `Expiring`: A value with an expiration timestamp (TTL support).
+/// - `Normal`：普通键值
+/// - `Tombstone`：删除标记（不含数据）
+/// - `Expiring`：带过期时间的值（TTL）
 ///
-/// # Serialization
-/// Each variant has a unique type tag for wire format encoding:
-/// - Normal = 0
-/// - Tombstone = 1
-/// - Expiring = 2
+/// 序列化：三种变体分别使用标签 0/1/2。
 #[derive(Clone, PartialEq)]
 #[repr(u8)]
 pub enum ValueType {
@@ -46,10 +61,10 @@ const VALUE_TOMBSTONE_LEN: usize = 0;
 const VALUE_EXPIRING_AT_LEN: usize = size_of::<u64>();
 
 impl ValueType {
-    /// Returns the type tag for serialization.
+    /// 返回用于序列化的类型标签
     ///
-    /// Used in WAL and SSTable formats to identify the variant during deserialization.
-    pub fn type_tag(&self) -> u8 {
+    /// 用于 WAL/SSTable 在反序列化时识别变体
+    pub fn tag(&self) -> u8 {
         match self {
             ValueType::Normal(_) => NORMAL_VALUE_TYPE,
             ValueType::Tombstone => TOMBSTONE_VALUE_TYPE,
@@ -57,46 +72,91 @@ impl ValueType {
         }
     }
 
-    /// Returns the total serialized length (data + metadata).
-    ///
-    /// This is the number of bytes occupied in the WAL/SSTable payload section
-    /// for this value, excluding the type tag.
-    ///
-    /// # Examples
-    /// - Normal("hello") → 5 bytes
-    /// - Tombstone → 0 bytes
-    /// - Expiring { data: "hello", expire_at: 123 } → 13 bytes (8 + 5)
-    pub fn serialized_len(&self) -> usize {
-        self.data_len() + self.meta_len()
+    /// 是否为删除标记
+    pub fn is_tombstone(&self) -> bool {
+        matches!(self, ValueType::Tombstone)
     }
 
-    /// Returns the length of the user data in bytes.
-    ///
-    /// For Tombstone, this is always 0.
-    pub fn data_len(&self) -> usize {
+    /// 是否在给定时间戳 `now` 上已过期
+    pub fn is_expired(&self, now: u64) -> bool {
+        match self {
+            &ValueType::Expiring { expire_at, .. } => expire_at <= now,
+            _ => false,
+        }
+    }
+
+    /// 获取过期时间戳（若无则返回 None）
+    pub fn expire_at(&self) -> Option<u64> {
+        match self {
+            &ValueType::Expiring { expire_at, .. } => Some(expire_at),
+            _ => None,
+        }
+    }
+
+    /// 获取数据内容（Tombstone 返回 None）
+    pub fn data(&self) -> Option<Bytes> {
+        match self {
+            ValueType::Normal(data) => Some(data.clone()),
+            ValueType::Expiring { data, .. } => Some(data.clone()),
+            ValueType::Tombstone => None,
+        }
+    }
+}
+
+impl Encode for ValueType {
+    type CodecError = ValueTypeError;
+
+    fn encode_to(&self, buf: &mut impl BufMut) -> Result<(), Self::CodecError> {
+        match self {
+            ValueType::Normal(data) => {
+                buf.put_slice(data);
+                Ok(())
+            }
+            ValueType::Tombstone => Ok(()), // nothing to write
+            ValueType::Expiring { data, expire_at } => {
+                buf.put_u64(*expire_at);
+                buf.put_slice(data);
+                Ok(())
+            }
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
         match self {
             ValueType::Normal(bytes) => bytes.len(),
             ValueType::Tombstone => VALUE_TOMBSTONE_LEN,
-            ValueType::Expiring { data, .. } => data.len(),
+            ValueType::Expiring { data, .. } => data.len() + VALUE_EXPIRING_AT_LEN,
         }
     }
+}
 
-    /// Returns the length of metadata in bytes (excluding the user data).
-    ///
-    /// - Normal: 0 (no metadata)
-    /// - Tombstone: 0 (no metadata)
-    /// - Expiring: 8 (expire_at timestamp)
-    pub fn meta_len(&self) -> usize {
-        match self {
-            ValueType::Normal(_) => 0,
-            ValueType::Tombstone => 0,
-            ValueType::Expiring { .. } => VALUE_EXPIRING_AT_LEN,
+impl DecodeWithContext for ValueType {
+    type CodecError = ValueTypeError;
+    type Context = u8;
+
+    fn decode_with(buf: &[u8], tag: Self::Context) -> Result<(Self, usize), Self::CodecError> {
+        match tag {
+            NORMAL_VALUE_TYPE => Ok((ValueType::Normal(Bytes::copy_from_slice(buf)), buf.len())),
+            TOMBSTONE_VALUE_TYPE => Ok((ValueType::Tombstone, buf.len())),
+            EXPIRING_VALUE_TYPE => {
+                // Body layout: [expire_at: u64 (BE)][data]
+                if buf.len() < VALUE_EXPIRING_AT_LEN {
+                    return Err(ValueTypeError::BufferTooShort {
+                        expected: VALUE_EXPIRING_AT_LEN,
+                        actual: buf.len(),
+                    });
+                }
+
+                let mut ts_buf = [0u8; VALUE_EXPIRING_AT_LEN];
+                ts_buf.copy_from_slice(&buf[..VALUE_EXPIRING_AT_LEN]);
+                let expire_at = u64::from_be_bytes(ts_buf);
+
+                let data = Bytes::copy_from_slice(&buf[VALUE_EXPIRING_AT_LEN..]);
+
+                Ok((ValueType::Expiring { data, expire_at }, buf.len()))
+            }
+            other => Err(ValueTypeError::UnknownTypeTag(other)),
         }
-    }
-
-    /// Checks if this value represents a deletion marker.
-    pub fn is_tombstone(&self) -> bool {
-        matches!(self, ValueType::Tombstone)
     }
 }
 
@@ -127,137 +187,82 @@ impl Debug for ValueType {
     }
 }
 
-/// Represents a single versioned record in the LSM-tree.
-///
-/// An `Entry` is the fundamental unit of data stored in the engine. It consists of:
-/// - A key (arbitrary bytes)
-/// - A value (Normal data, Tombstone, or Expiring value)
-/// - A sequence number (monotonically increasing, used for MVCC)
-///
-/// # Ordering Semantics
-/// Entries are ordered by:
-/// 1. **Key** (Ascending) - Primary sort key
-/// 2. **Sequence Number** (Descending) - Newer versions appear first
-///
-/// This ordering is critical for LSM-tree operations:
-/// - During compaction, newer versions shadow older ones
-/// - Point queries can stop at the first match (latest version)
-/// - Range scans naturally iterate over the latest versions
-///
-/// # Examples
-/// ```ignore
-/// let e1 = Entry::new_normal(100, key.clone(), value1);
-/// let e2 = Entry::new_normal(200, key.clone(), value2);
-///
-/// assert!(e2 < e1); // seq=200 comes before seq=100
-/// ```
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Entry {
-    key: Bytes,
-    val: ValueType,
-    seq: u64,
-}
+    /// 键，使用 Bytes 避免拷贝
+    pub key: Bytes,
 
-const ENTRY_SEQ_LEN: usize = size_of::<u64>();
+    /// 值类型（包含实际数据或标记）
+    pub value: ValueType,
+
+    /// 全局序列号，保证写入顺序
+    pub sequence: u64,
+}
 
 impl Entry {
-    /// Creates a new entry with the given sequence number, key, and value type.
-    ///
-    /// This is the internal constructor. Use `new_normal`, `new_tombstone`, or
-    /// `new_expiring` for specific value types.
-    pub fn new(seq: u64, key: Bytes, val: ValueType) -> Self {
-        Self { key, val, seq }
-    }
-
-    /// Creates a deletion marker entry (Tombstone).
-    ///
-    /// Tombstones are used to mark deleted keys in the LSM-tree. They are
-    /// removed during compaction when they are the oldest version of a key.
-    pub fn new_tombstone(seq: u64, key: Bytes) -> Self {
-        Self::new(seq, key, ValueType::Tombstone)
-    }
-
-    /// Creates a standard value entry (Normal).
-    pub fn new_normal(seq: u64, key: Bytes, val: Bytes) -> Self {
-        Self::new(seq, key, ValueType::Normal(val))
-    }
-
-    /// Creates an expiring value entry with TTL.
-    ///
-    /// # Arguments
-    /// * `seq` - Sequence number
-    /// * `key` - Key bytes
-    /// * `val` - Value bytes
-    /// * `expire_at` - Unix timestamp (seconds) when this entry expires
-    pub fn new_expiring(seq: u64, key: Bytes, val: Bytes, expire_at: u64) -> Self {
-        Self::new(
-            seq,
+    /// 创建普通数据条目
+    pub fn new(key: Bytes, value: ValueType, sequence: u64) -> Self {
+        Self {
             key,
-            ValueType::Expiring {
-                data: val,
+            value,
+            sequence,
+        }
+    }
+
+    /// 创建删除标记条目
+    pub fn new_tombstone(key: Bytes, sequence: u64) -> Self {
+        Self {
+            key,
+            value: ValueType::Tombstone,
+            sequence,
+        }
+    }
+
+    /// 创建带TTL的条目
+    pub fn new_expiring(key: Bytes, value: Bytes, sequence: u64, expire_at: u64) -> Self {
+        Self {
+            key,
+            value: ValueType::Expiring {
+                data: value,
                 expire_at,
             },
-        )
+            sequence,
+        }
     }
 
-    /// Returns `true` if this entry is a deletion marker.
+    /// 创建Normal的条目
+    pub fn new_normal(key: Bytes, value: Bytes, sequence: u64) -> Self {
+        Self {
+            key,
+            value: ValueType::Normal(value),
+            sequence,
+        }
+    }
+
+    /// 检查条目是否已过期
+    pub fn is_expired(&self, now: u64) -> bool {
+        self.value.is_expired(now)
+    }
+
+    /// 检查是否为删除标记
     pub fn is_tombstone(&self) -> bool {
-        self.val.is_tombstone()
+        self.value.is_tombstone()
     }
 
-    /// Returns the estimated memory size of this entry in bytes.
-    ///
-    /// This includes:
-    /// - Key length
-    /// - Value serialized length (data + metadata)
-    /// - Sequence number (8 bytes)
-    ///
-    /// Used primarily for Memtable size calculations to trigger flush operations.
-    pub fn estimated_size(&self) -> usize {
-        self.key.len() + self.val.serialized_len() + ENTRY_SEQ_LEN
-    }
-
-    /// Returns a reference to the key.
-    pub fn key(&self) -> &Bytes {
-        &self.key
-    }
-
-    /// Returns a reference to the value type.
-    pub fn val(&self) -> &ValueType {
-        &self.val
-    }
-
-    /// Returns the sequence number.
-    pub fn seq(&self) -> u64 {
-        self.seq
+    /// 获取实际数据（如果存在）
+    pub fn data(&self) -> Option<Bytes> {
+        self.value.data()
     }
 }
 
-impl Debug for Entry {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        // Truncate key output for readability in logs
-        let debug_len = min(self.key.len(), MAX_KEY_DEBUG_LEN);
-
-        f.debug_struct("Entry")
-            .field("key", &String::from_utf8_lossy(&self.key[..debug_len]))
-            .field("val", &self.val)
-            .field("seq", &self.seq)
-            .finish()
+/// Entry 按 key 排序，相同 key 按 sequence 降序
+impl Ord for Entry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key
+            .cmp(&other.key)
+            .then(other.sequence.cmp(&self.sequence))
     }
 }
-
-impl PartialEq for Entry {
-    fn eq(&self, other: &Self) -> bool {
-        // Consistent with Ord: checks both Key and Seq.
-        //
-        // Note: If Seq matches, Key MUST match in a valid LSM system (Seq is globally unique).
-        // We check Key here to strictly adhere to the PartialOrd/Ord contract.
-        // Short-circuiting (`&&`) ensures no performance penalty if Seqs differ.
-        self.seq == other.seq && self.key == other.key
-    }
-}
-
-impl Eq for Entry {}
 
 impl PartialOrd for Entry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -265,89 +270,14 @@ impl PartialOrd for Entry {
     }
 }
 
-impl Ord for Entry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Critical LSM Ordering:
-        // 1. Compare Key (Ascending)
-        // 2. Compare Seq (Descending)
-        //
-        // Descending Seq ensures that when scanning, the latest version of a key
-        // appears first, allowing for efficient lookups (finding the first match is enough).
-        self.key.cmp(&other.key).then(other.seq.cmp(&self.seq))
+impl PartialEq for Entry {
+    fn eq(&self, other: &Self) -> bool {
+        // 与 Ord 保持一致：同时比较 Key 与 Seq。
+        // 说明：在有效的 LSM 系统中，Seq 全局唯一；若 Seq 相等，则 Key 也应相等。
+        // 这里仍检查 Key 以严格遵守 PartialOrd/Ord 契约；
+        // 使用短路求值避免 Seq 不等时的多余比较。
+        self.sequence == other.sequence && self.key == other.key
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_entry_ordering() {
-        let key1 = Bytes::from("key1");
-        let key2 = Bytes::from("key2");
-
-        // Case 1: Same key, different seq. Newer seq (larger) should come first.
-        let e1_seq100 = Entry::new_normal(100, key1.clone(), Bytes::from("v1"));
-        let e1_seq200 = Entry::new_normal(200, key1.clone(), Bytes::from("v2"));
-
-        // e1_seq200 (newer) < e1_seq100 (older) because we want newer items first in sort
-        assert_eq!(e1_seq200.cmp(&e1_seq100), Ordering::Less);
-        assert!(e1_seq200 < e1_seq100);
-
-        // Case 2: Different key. key1 < key2 (Ascending).
-        let e2_seq300 = Entry::new_normal(300, key2.clone(), Bytes::from("v3"));
-        assert_eq!(e1_seq200.cmp(&e2_seq300), Ordering::Less);
-        assert!(e1_seq200 < e2_seq300);
-
-        // Case 3: Vector sort test
-        let mut entries = vec![
-            e1_seq100.clone(), // key1, seq 100
-            e2_seq300.clone(), // key2, seq 300
-            e1_seq200.clone(), // key1, seq 200
-        ];
-        entries.sort();
-
-        // Expected order:
-        // 1. key1, seq 200 (Newer)
-        // 2. key1, seq 100 (Older)
-        // 3. key2, seq 300
-        assert_eq!(entries[0].seq(), 200);
-        assert_eq!(entries[0].key(), &key1);
-
-        assert_eq!(entries[1].seq(), 100);
-        assert_eq!(entries[1].key(), &key1);
-
-        assert_eq!(entries[2].seq(), 300);
-        assert_eq!(entries[2].key(), &key2);
-    }
-
-    #[test]
-    fn test_entry_size() {
-        let key = Bytes::from("key"); // 3 bytes
-        let val = Bytes::from("value"); // 5 bytes
-        let entry = Entry::new_normal(1, key, val);
-
-        // 3 (key) + 5 (value) + 8 (seq) = 16
-        assert_eq!(entry.estimated_size(), 16);
-
-        let tombstone = Entry::new_tombstone(1, Bytes::from("key"));
-        // 3 (key) + 0 (tombstone) + 8 (seq) = 11
-        assert_eq!(tombstone.estimated_size(), 11);
-    }
-
-    #[test]
-    fn test_entry_equality() {
-        let key = Bytes::from("key");
-        let val1 = Bytes::from("val1");
-        let val2 = Bytes::from("val2");
-
-        let e1 = Entry::new_normal(100, key.clone(), val1);
-        let e2 = Entry::new_normal(100, key.clone(), val2); // Same key+seq, different value
-
-        // In LSM, same key+seq means same entry. Value should be ignored in equality.
-        assert_eq!(e1, e2);
-
-        let e3 = Entry::new_normal(101, key.clone(), Bytes::from("val1"));
-        assert_ne!(e1, e3); // Different seq
-    }
-}
+impl Eq for Entry {}

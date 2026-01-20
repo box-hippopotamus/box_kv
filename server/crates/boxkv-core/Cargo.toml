@@ -1,13 +1,48 @@
 [package]
 name = "boxkv-core"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
 
 [dependencies]
-thiserror = "2.0.17"
-bytes = "1.11.0"
+tracing = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+boxkv-common = { path = "../boxkv-common" }
+boxkv-storage = { path = "../boxkv-storage" }
+boxkv-executor = { path = "../boxkv-executor" }
+
 crc32fast = "1.5.0"
-tracing = "0.1"
+parking_lot = "0.12.5"
+crossbeam-skiplist = { workspace = true }
+moka = { version = "0.12", features = ["sync"] }
+arc-swap = "1.7"
+
+# 压缩算法支持（可选 feature）
+crc32c = "0.6"
+snap = { version = "1.1", optional = true }
+lz4 = { version = "1.24", optional = true }
+zstd = { version = "0.13", optional = true }
+
+# 哈希算法
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Session 管理和 Cursor 编码
+getrandom = "0.2"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+[features]
+default = ["snappy"]
+snappy = ["dep:snap"]
+lz4 = ["dep:lz4"]
+zstd = ["dep:zstd"]
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }

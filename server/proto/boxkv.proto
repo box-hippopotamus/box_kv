@@ -1,0 +1,229 @@
+syntax = "proto3";
+
+package boxkv.v1;
+
+// BoxKV 核心服务
+service BoxKV {
+  // 基础 KV 操作
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc WriteBatch(WriteBatchRequest) returns (WriteBatchResponse);
+  
+  // 批量操作
+  rpc MultiGet(MultiGetRequest) returns (MultiGetResponse);
+  
+  // 条件写入
+  rpc CompareAndSet(CompareAndSetRequest) returns (CompareAndSetResponse);
+  rpc PutIfAbsent(PutIfAbsentRequest) returns (PutIfAbsentResponse);
+  
+  // TTL 操作
+  rpc ExpireAt(ExpireAtRequest) returns (ExpireAtResponse);
+  
+  // 扫描操作
+  rpc Scan(ScanRequest) returns (ScanResponse);
+  rpc ScanStream(ScanRequest) returns (stream ScanStreamResponse);
+}
+
+// Plugin 管理服务
+service Plugin {
+  rpc Upload(UploadRequest) returns (UploadResponse);
+  rpc Ensure(EnsureRequest) returns (EnsureResponse);
+  rpc GetLatest(GetLatestRequest) returns (GetLatestResponse);
+  rpc Purge(PurgeRequest) returns (PurgeResponse);
+}
+
+// Wasm 插件执行计划
+message WasmPlan {
+  repeated string pre_write = 1;
+  repeated string post_write = 2;
+  repeated string on_read = 3;
+  repeated string scan_filter = 4;
+}
+
+// Put 请求
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+  oneof expiry {
+    uint64 ttl_secs = 3;
+    uint64 expires_at = 4;
+  }
+  WasmPlan plan = 5;
+}
+
+message PutResponse {}
+
+// Get 请求
+message GetRequest {
+  bytes key = 1;
+  WasmPlan plan = 2;
+}
+
+message GetResponse {
+  bool found = 1;
+  bytes value = 2;
+}
+
+// Delete 请求
+message DeleteRequest {
+  bytes key = 1;
+  WasmPlan plan = 2;
+}
+
+message DeleteResponse {}
+
+// WriteBatch
+enum OpType {
+  OP_PUT = 0;
+  OP_DELETE = 1;
+}
+
+message WriteBatchOp {
+  OpType op = 1;
+  bytes key = 2;
+  bytes value = 3;
+  oneof expiry {
+    uint64 ttl_secs = 4;
+    uint64 expires_at = 5;
+  }
+}
+
+message WriteBatchRequest {
+  repeated WriteBatchOp ops = 1;
+  WasmPlan plan = 2;
+}
+
+message WriteBatchResponse {}
+
+// Plugin Upload
+message UploadRequest {
+  string name = 1;
+  string version = 2;
+  string hook = 3;
+  bytes wasm = 4;
+}
+
+message UploadResponse {
+  string plugin_id = 1;
+  string fingerprint = 2;
+}
+
+// Plugin Ensure
+message EnsureRequest {
+  string name = 1;
+  string version = 2;
+  string hook = 3;
+  string fingerprint = 4;
+}
+
+message EnsureResponse {
+  bool exists = 1;
+  string plugin_id = 2;
+  bool fingerprint_match = 3;
+}
+
+// Plugin GetLatest
+message GetLatestRequest {
+  string name = 1;
+  string hook = 2;
+}
+
+message GetLatestResponse {
+  bool found = 1;
+  string plugin_id = 2;
+  string version = 3;
+  string fingerprint = 4;
+}
+
+// Plugin Purge
+message PurgeRequest {
+  string name = 1;
+  uint32 major_version = 2;
+}
+
+message PurgeResponse {
+  uint32 purged_count = 1;
+}
+
+// ========== 批量操作 ==========
+
+// MultiGet 请求
+message MultiGetRequest {
+  repeated bytes keys = 1;
+  WasmPlan plan = 2;
+}
+
+message MultiGetResponse {
+  repeated GetResult results = 1;
+}
+
+message GetResult {
+  bool found = 1;
+  bytes value = 2;
+}
+
+// ========== 条件写入 ==========
+
+// CompareAndSet
+message CompareAndSetRequest {
+  bytes key = 1;
+  optional bytes expected_value = 2;  // None 表示期望不存在
+  optional bytes new_value = 3;       // None 表示删除
+  WasmPlan plan = 4;
+}
+
+message CompareAndSetResponse {
+  bool success = 1;
+}
+
+// PutIfAbsent
+message PutIfAbsentRequest {
+  bytes key = 1;
+  bytes value = 2;
+  WasmPlan plan = 3;
+}
+
+message PutIfAbsentResponse {
+  bool success = 1;
+}
+
+// ========== TTL 操作 ==========
+
+// ExpireAt
+message ExpireAtRequest {
+  bytes key = 1;
+  uint64 expire_at = 2;  // Unix timestamp (秒)
+  WasmPlan plan = 3;
+}
+
+message ExpireAtResponse {
+  bool success = 1;  // false 表示 key 不存在
+}
+
+// ========== 扫描操作 ==========
+
+// 扫描请求
+message ScanRequest {
+  bytes start_key = 1;
+  bytes end_key = 2;
+  uint32 limit = 3;
+  optional string cursor = 4;  // 分页游标（可选）
+  WasmPlan plan = 5;
+}
+
+message ScanResponse {
+  repeated KeyValue pairs = 1;
+  optional string next_cursor = 2;  // 下一页游标（可选）
+  bool has_more = 3;
+}
+
+message ScanStreamResponse {
+  repeated KeyValue pairs = 1;
+}
+
+// 键值对
+message KeyValue {
+  bytes key = 1;
+  bytes value = 2;
+}

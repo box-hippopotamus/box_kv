@@ -1,533 +1,250 @@
-mod storage;
-pub use storage::StorageConfig;
-
+mod compaction;
+mod error;
+mod executor;
+mod limits;
 mod server;
+mod sstable;
+mod storage;
+mod wasm;
+
+pub use compaction::CompactionConfig;
+pub use error::ConfigError;
+pub use executor::ExecutorConfig;
+pub use limits::LimitsConfig;
 pub use server::ServerConfig;
+pub use sstable::{CompressionType, FilterBlockType, FilterPolicyType, SSTableConfig};
+pub use storage::{StorageConfig, WalSyncMode};
+pub use wasm::{
+    PluginServiceConfig, WasmBudgetConfig, WasmCacheConfig, WasmConfig, WasmPoolConfig,
+    WasmRuntimeConfig,
+};
 
-use serde::Deserialize;
-use std::env;
-use std::path::PathBuf;
-use std::sync::OnceLock;
-use thiserror::Error;
-use tracing::{debug, info};
+use once_cell::sync::OnceCell;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
-/// Errors that can occur during configuration loading or validation.
-#[derive(Debug, Error)]
-pub enum ConfigError {
-    /// The configuration file specified by `BOXKV_CONFIG` was not found.
-    #[error("Config file not found: {path:?}")]
-    FileNotFound { path: PathBuf },
+static GLOBAL_CONFIG: OnceCell<Arc<GlobalConfig>> = OnceCell::new();
 
-    /// Failed to parse the configuration file or environment variables.
-    #[error("Failed to parse config")]
-    ParseError(#[from] config::ConfigError),
-
-    /// Error in server configuration validation.
-    #[error(transparent)]
-    Server(#[from] server::ServerConfigError),
-
-    /// Error in storage configuration validation.
-    #[error(transparent)]
-    Storage(#[from] storage::StorageConfigError),
-}
-
-/// The global configuration for the BoxKV server.
-///
-/// This struct aggregates configurations for various subsystems (storage, server, etc.).
-/// It is designed to be loaded once at startup and accessed globally via `Config::global()`.
-#[derive(Debug, Deserialize)]
-pub struct Config {
-    /// Configuration for the storage engine.
-    #[serde(default)]
-    pub storage: StorageConfig,
-
-    /// Configuration for the network server.
+/// BoxKV 全局配置
+/// 线程安全，初始化后只读
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GlobalConfig {
     #[serde(default)]
     pub server: ServerConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
+    pub compaction: CompactionConfig,
+    #[serde(default)]
+    pub sstable: SSTableConfig,
+    #[serde(default)]
+    pub wasm: WasmConfig,
+    #[serde(default)]
+    pub limits: LimitsConfig,
+    #[serde(default)]
+    pub executor: ExecutorConfig,
 }
 
-static CONFIG: OnceLock<Config> = OnceLock::new();
+impl GlobalConfig {
+    /// 从 TOML 文件加载配置
+    pub fn load_from_file(path: &str) -> Result<Self, ConfigError> {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            ConfigError::LoadFailed(format!("Failed to read config file '{}': {}", path, e))
+        })?;
 
-impl Config {
-    /// Returns a reference to the global configuration singleton.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `Config::init()` has not been called successfully before calling this method.
-    pub fn global() -> &'static Self {
-        CONFIG
-            .get()
-            .expect("Config is not initialized! Call Config::init() first.")
+        let config: Self = toml::from_str(&content)
+            .map_err(|e| ConfigError::TomlParseError(format!("Failed to parse TOML: {}", e)))?;
+
+        config.validate()?;
+        Ok(config)
     }
 
-    /// Initializes the global configuration.
-    ///
-    /// This method should be called once at the start of the application. It loads the configuration
-    /// from files and environment variables, validates it, and sets the global singleton.
-    ///
-    /// If the configuration is already initialized, this method does nothing and returns `Ok(())`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConfigError` if loading or validation fails.
-    pub fn init() -> Result<(), ConfigError> {
-        if CONFIG.get().is_none() {
-            info!("Initializing BoxKV configuration");
-            let config = Config::load()?;
-            let _ = CONFIG.set(config);
-        }
+    /// 将配置保存为 TOML 文件
+    pub fn save_to_file(&self, path: &str) -> Result<(), ConfigError> {
+        let content = toml::to_string_pretty(self).map_err(|e| {
+            ConfigError::TomlSerializeError(format!("Failed to serialize config: {}", e))
+        })?;
+
+        std::fs::write(path, content).map_err(ConfigError::Io)?;
 
         Ok(())
     }
 
-    fn load() -> Result<Self, ConfigError> {
-        let mut builder = config::Config::builder();
+    /// 按优先级加载配置：环境变量 > TOML 文件 > 默认值
+    pub fn load() -> Result<Self, ConfigError> {
+        // 1. Check for config file path from environment variable
+        let config_path =
+            std::env::var("BOXKV_CONFIG").unwrap_or_else(|_| "boxkv.toml".to_string());
 
-        // 1. Try to load the configuration file
-        if let Some(config_file) = Self::find_config_file()? {
-            info!(?config_file, "Loading configuration file");
-            builder = builder.add_source(config::File::from(config_file).required(true));
+        // 2. Load from file if exists, otherwise use defaults
+        let mut config = if std::path::Path::new(&config_path).exists() {
+            tracing::info!("Loading configuration from: {}", config_path);
+            Self::load_from_file(&config_path)?
         } else {
-            info!("No config file found, using defaults and environment variables");
-        }
+            tracing::info!("Config file '{}' not found, using defaults", config_path);
+            Self::default()
+        };
 
-        // 2. Environment variable override
-        builder = builder
-            .add_source(config::Environment::with_prefix(ENV_PREFIX).separator(ENV_SEPARATOR));
+        // 3. Apply environment variable overrides
+        config.apply_env_overrides();
 
-        // 3. Build and deserialize
-        let config: Self = builder
-            .build()
-            .map_err(ConfigError::ParseError)?
-            .try_deserialize()
-            .map_err(ConfigError::ParseError)?;
-
-        // 4. Validate
+        // 4. Validate final configuration
         config.validate()?;
-
-        debug!(
-            data_dir = ?config.storage.data_dir,
-            memtable_size_mb = config.storage.memtable_size_mb,
-            host = %config.server.host,
-            port = config.server.port,
-            "Configuration loaded and validated"
-        );
 
         Ok(config)
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
-        self.storage.validate()?;
-        self.server.validate()?;
+    /// 应用环境变量对配置的覆盖
+    fn apply_env_overrides(&mut self) {
+        // Server configuration
+        if let Ok(host) = std::env::var("BOXKV_SERVER_HOST") {
+            tracing::info!("Override server.host from env: {}", host);
+            self.server.host = host;
+        }
+        if let Ok(port) = std::env::var("BOXKV_SERVER_PORT")
+            && let Ok(p) = port.parse() {
+                tracing::info!("Override server.port from env: {}", p);
+                self.server.port = p;
+            }
+        if let Ok(workers) = std::env::var("BOXKV_SERVER_WORKERS")
+            && let Ok(w) = workers.parse() {
+                tracing::info!("Override server.workers from env: {}", w);
+                self.server.workers = w;
+            }
+
+        // Storage configuration
+        if let Ok(data_dir) = std::env::var("BOXKV_STORAGE_DATA_DIR") {
+            tracing::info!("Override storage.data_dir from env: {}", data_dir);
+            self.storage.data_dir = data_dir;
+        }
+        if let Ok(wal_dir) = std::env::var("BOXKV_STORAGE_WAL_DIR") {
+            tracing::info!("Override storage.wal_dir from env: {}", wal_dir);
+            self.storage.wal_dir = wal_dir;
+        }
+        if let Ok(memtable_size) = std::env::var("BOXKV_STORAGE_MEMTABLE_SIZE_MB")
+            && let Ok(s) = memtable_size.parse() {
+                tracing::info!("Override storage.memtable_size_mb from env: {}", s);
+                self.storage.memtable_size_mb = s;
+            }
+        if let Ok(cache_size) = std::env::var("BOXKV_STORAGE_BLOCK_CACHE_SIZE_MB")
+            && let Ok(s) = cache_size.parse() {
+                tracing::info!("Override storage.block_cache_size_mb from env: {}", s);
+                self.storage.block_cache_size_mb = s;
+            }
+
+        // Compaction configuration
+        if let Ok(max_levels) = std::env::var("BOXKV_COMPACTION_MAX_LEVELS")
+            && let Ok(l) = max_levels.parse() {
+                tracing::info!("Override compaction.max_levels from env: {}", l);
+                self.compaction.max_levels = l;
+            }
+        if let Ok(level0_trigger) = std::env::var("BOXKV_COMPACTION_LEVEL0_TRIGGER")
+            && let Ok(t) = level0_trigger.parse() {
+                tracing::info!("Override compaction.level0_trigger from env: {}", t);
+                self.compaction.level0_trigger = t;
+            }
+        if let Ok(max_jobs) = std::env::var("BOXKV_COMPACTION_MAX_BACKGROUND_JOBS")
+            && let Ok(j) = max_jobs.parse() {
+                tracing::info!("Override compaction.max_background_jobs from env: {}", j);
+                self.compaction.max_background_jobs = j;
+            }
+
+        // Wasm configuration
+        if let Ok(enabled) = std::env::var("BOXKV_WASM_ENABLED")
+            && let Ok(e) = enabled.parse::<bool>() {
+                tracing::info!("Override wasm.enabled from env: {}", e);
+                self.wasm.enabled = e;
+            }
+        if let Ok(max_fuel) = std::env::var("BOXKV_WASM_MAX_FUEL")
+            && let Ok(f) = max_fuel.parse() {
+                tracing::info!("Override wasm.runtime.budget.max_fuel from env: {}", f);
+                self.wasm.runtime.budget.max_fuel = f;
+            }
+        if let Ok(timeout) = std::env::var("BOXKV_WASM_TIMEOUT_MS")
+            && let Ok(t) = timeout.parse() {
+                tracing::info!("Override wasm.runtime.budget.timeout_ms from env: {}", t);
+                self.wasm.runtime.budget.timeout_ms = t;
+            }
+    }
+
+    /// 校验配置项的取值有效性
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.compaction.max_levels < 2 {
+            return Err(ConfigError::InvalidValue(
+                "max_levels must be at least 2".to_string(),
+            ));
+        }
+        if self.compaction.level0_trigger == 0 {
+            return Err(ConfigError::InvalidValue(
+                "level0_trigger must be greater than 0".to_string(),
+            ));
+        }
+        if self.storage.memtable_size_mb == 0 {
+            return Err(ConfigError::InvalidValue(
+                "memtable_size_mb must be greater than 0".to_string(),
+            ));
+        }
         Ok(())
     }
 
-    fn find_config_file() -> Result<Option<PathBuf>, ConfigError> {
-        // Check environment variable
-        if let Ok(path) = env::var(ENV_VAR_CONFIG_FILE) {
-            let path = PathBuf::from(path);
-            return if !path.exists() {
-                Err(ConfigError::FileNotFound { path })
-            } else {
-                Ok(Some(path))
-            };
-        }
+    /// 初始化全局配置单例（仅允许调用一次）
+    pub fn init(config: GlobalConfig) -> Result<(), ConfigError> {
+        config.validate()?;
+        GLOBAL_CONFIG
+            .set(Arc::new(config))
+            .map_err(|_| ConfigError::AlreadyInitialized)
+    }
 
-        // Check working directory
-        let default_path = PathBuf::from(DEFAULT_CONFIG_PATH);
-        if default_path.exists() {
-            return Ok(Some(default_path));
-        }
+    /// 获取全局配置的引用（未初始化会 panic）
+    pub fn get() -> &'static Arc<GlobalConfig> {
+        GLOBAL_CONFIG
+            .get()
+            .expect("GlobalConfig not initialized. Call GlobalConfig::init() first.")
+    }
 
-        Ok(None)
+    /// 尝试获取全局配置的引用（未初始化返回 None）
+    pub fn try_get() -> Option<&'static Arc<GlobalConfig>> {
+        GLOBAL_CONFIG.get()
     }
 }
-
-const ENV_PREFIX: &str = "BOXKV";
-const ENV_SEPARATOR: &str = "__";
-const ENV_VAR_CONFIG_FILE: &str = "BOXKV_CONFIG";
-const DEFAULT_CONFIG_PATH: &str = "./config.toml";
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-
-    #[test]
-    fn test_find_config_file_none() {
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        // Save and remove default config if exists
-        let default_path = PathBuf::from(DEFAULT_CONFIG_PATH);
-        let backup = if default_path.exists() {
-            let content = fs::read(&default_path).ok();
-            fs::remove_file(&default_path).ok();
-            content
-        } else {
-            None
-        };
-
-        let result = Config::find_config_file();
-
-        // Restore default config if it existed
-        if let Some(content) = backup {
-            fs::write(&default_path, content).ok();
-        }
-
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_find_config_file_default_exists() {
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        let config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
-
-        // Backup existing config
-        let backup = if config_path.exists() {
-            let content = fs::read(&config_path).ok();
-            fs::remove_file(&config_path).ok();
-            content
-        } else {
-            None
-        };
-
-        // Create test config
-        fs::write(&config_path, "[storage]\ndata_dir = \"./data\"\n").unwrap();
-
-        let result = Config::find_config_file();
-
-        // Cleanup and restore
-        fs::remove_file(&config_path).ok();
-        if let Some(content) = backup {
-            fs::write(&config_path, content).ok();
-        }
-
-        assert!(
-            result.is_ok(),
-            "find_config_file failed: {:?}",
-            result.err()
-        );
-        assert_eq!(result.unwrap(), Some(config_path));
-    }
-
-    #[test]
-    fn test_find_config_file_env_exists() {
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let test_config = temp_dir.path().join("env_test.toml");
-
-        fs::write(&test_config, "[storage]\ndata_dir = \"./data\"\n").unwrap();
-
-        unsafe {
-            env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
-        }
-
-        let result = Config::find_config_file();
-
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Some(test_config));
-    }
-
-    #[test]
-    fn test_find_config_file_env_not_exists() {
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let non_existent = temp_dir.path().join("non_existent.toml");
-
-        unsafe {
-            env::set_var(ENV_VAR_CONFIG_FILE, &non_existent);
-        }
-
-        let result = Config::find_config_file();
-
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        assert!(result.is_err());
-
-        match result.unwrap_err() {
-            ConfigError::FileNotFound { path } => {
-                assert_eq!(path, non_existent);
-            }
-            _ => panic!("Expected FileNotFound error"),
-        }
-    }
-
-    #[test]
-    fn test_find_config_file_env_priority() {
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let env_config = temp_dir.path().join("env_priority.toml");
-        let default_config = PathBuf::from(DEFAULT_CONFIG_PATH);
-
-        // Backup default config
-        let backup = if default_config.exists() {
-            let content = fs::read(&default_config).ok();
-            fs::remove_file(&default_config).ok();
-            content
-        } else {
-            None
-        };
-
-        fs::write(&env_config, "[storage]\nmemtable_size_mb = 128\n").unwrap();
-        fs::write(&default_config, "[storage]\nmemtable_size_mb = 64\n").unwrap();
-
-        unsafe {
-            env::set_var(ENV_VAR_CONFIG_FILE, &env_config);
-        }
-
-        let result = Config::find_config_file();
-
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        // Cleanup default config and restore
-        fs::remove_file(&default_config).ok();
-        if let Some(content) = backup {
-            fs::write(&default_config, content).ok();
-        }
-
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Some(env_config));
-    }
-
-    #[test]
-    fn test_config_error_display() {
-        let err = ConfigError::FileNotFound {
-            path: PathBuf::from("/path/to/config.toml"),
-        };
-        let msg = format!("{}", err);
-        assert!(msg.contains("Config file not found"));
-        assert!(msg.contains("/path/to/config.toml"));
-
-        let err = ConfigError::ParseError(config::ConfigError::Message("test error".to_string()));
-        let msg = format!("{}", err);
-        assert!(msg.contains("Failed to parse config"));
-    }
 
     #[test]
     fn test_config_default_values() {
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let test_data_dir = temp_dir.path().join("data");
-        let test_config = temp_dir.path().join("default_test.toml");
-
-        // Use forward slashes for TOML compatibility (works on both Windows and Unix)
-        let data_dir_str = test_data_dir.display().to_string().replace('\\', "/");
-
-        let config_content = format!(
-            r#"
-[storage]
-data_dir = "{}"
-
-[server]
-host = "127.0.0.1"
-port = 21524
-"#,
-            data_dir_str
-        );
-
-        fs::write(&test_config, config_content).unwrap();
-
-        unsafe {
-            env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
-        }
-
-        let result = Config::load();
-
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        assert!(result.is_ok(), "Config load failed: {:?}", result.err());
-        let config = result.unwrap();
-        assert_eq!(config.storage.data_dir, test_data_dir);
-        assert_eq!(config.server.host, "127.0.0.1");
-        assert_eq!(config.server.port, 21524);
+        let cfg = GlobalConfig::default();
+        assert_eq!(cfg.compaction.max_levels, 7);
+        assert_eq!(cfg.compaction.level0_trigger, 4);
+        assert_eq!(cfg.storage.memtable_size_mb, 64);
     }
 
     #[test]
-    fn test_config_custom_values() {
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
+    fn test_config_validation() {
+        let mut cfg = GlobalConfig::default();
+        assert!(cfg.validate().is_ok());
 
-        let temp_dir = tempfile::tempdir().unwrap();
-        let data_dir = temp_dir.path().join("data");
-        let test_config = temp_dir.path().join("custom_test.toml");
+        cfg.compaction.max_levels = 1;
+        assert!(cfg.validate().is_err());
 
-        // Use forward slashes for TOML compatibility (works on both Windows and Unix)
-        let data_dir_str = data_dir.display().to_string().replace('\\', "/");
-
-        let config_content = format!(
-            r#"
-[storage]
-data_dir = "{}"
-memtable_size_mb = 128
-
-[server]
-host = "0.0.0.0"
-port = 8080
-"#,
-            data_dir_str
-        );
-
-        fs::write(&test_config, config_content).unwrap();
-
-        unsafe {
-            env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
-        }
-
-        let result = Config::load();
-
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        assert!(result.is_ok(), "Config load failed: {:?}", result.err());
-        let config = result.unwrap();
-        assert_eq!(config.storage.data_dir, data_dir);
-        assert_eq!(config.storage.memtable_size_mb, 128);
-        assert_eq!(config.server.host, "0.0.0.0");
-        assert_eq!(config.server.port, 8080);
+        cfg.compaction.max_levels = 7;
+        cfg.compaction.level0_trigger = 0;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
-    fn test_config_validation_fail_storage() {
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let test_config = temp_dir.path().join("validation_fail_storage.toml");
-
-        let config_content = r#"
-[storage]
-memtable_size_mb = 0
-
-[server]
-host = "127.0.0.1"
-port = 8080
-"#;
-
-        fs::write(&test_config, config_content).unwrap();
-
-        unsafe {
-            env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
-        }
-
-        let result = Config::load();
-
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        assert!(result.is_err(), "Expected error but got Ok");
-        match result.unwrap_err() {
-            ConfigError::Storage(_) => {} // Expected
-            e => panic!("Expected Storage error, got: {:?}", e),
-        }
+    fn test_compaction_target_level_bytes() {
+        let cfg = CompactionConfig::default();
+        assert_eq!(cfg.target_level_bytes(0), u64::MAX);
+        assert_eq!(cfg.target_level_bytes(1), 256 * 1024 * 1024);
+        assert_eq!(cfg.target_level_bytes(2), 2560 * 1024 * 1024);
     }
 
     #[test]
-    fn test_config_validation_fail_server() {
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let data_dir = temp_dir.path().join("data");
-        let test_config = temp_dir.path().join("validation_fail_server.toml");
-
-        // Use forward slashes for TOML compatibility (works on both Windows and Unix)
-        let data_dir_str = data_dir.display().to_string().replace('\\', "/");
-
-        let config_content = format!(
-            r#"
-[storage]
-data_dir = "{}"
-memtable_size_mb = 64
-
-[server]
-host = "invalid-host"
-port = 8080
-"#,
-            data_dir_str
-        );
-
-        fs::write(&test_config, config_content).unwrap();
-
-        unsafe {
-            env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
-        }
-
-        let result = Config::load();
-
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        assert!(result.is_err(), "Expected error but got Ok");
-        match result.unwrap_err() {
-            ConfigError::Server(_) => {} // Expected
-            e => panic!("Expected Server error, but got: {:?}", e),
-        }
-    }
-
-    #[test]
-    fn test_config_parse_error() {
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let test_config = temp_dir.path().join("parse_error_test.toml");
-
-        let config_content = r#"
-[storage]
-memtable_size_mb = "not_a_number"
-"#;
-
-        fs::write(&test_config, config_content).unwrap();
-
-        unsafe {
-            env::set_var(ENV_VAR_CONFIG_FILE, &test_config);
-        }
-
-        let result = Config::load();
-
-        unsafe {
-            env::remove_var(ENV_VAR_CONFIG_FILE);
-        }
-
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ConfigError::ParseError(_) => {} // Expected
-            _ => panic!("Expected ParseError"),
-        }
+    fn test_compaction_target_file_size() {
+        let cfg = CompactionConfig::default();
+        assert_eq!(cfg.target_file_size_bytes(0), 64 * 1024 * 1024);
+        assert_eq!(cfg.target_file_size_bytes(1), 64 * 1024 * 1024);
     }
 }

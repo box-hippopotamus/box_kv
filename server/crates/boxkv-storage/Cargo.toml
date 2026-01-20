@@ -1,6 +1,15 @@
 [package]
 name = "boxkv-storage"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
 
 [dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -4,15 +4,14 @@ mod writer;
 use crate::wal::reader::{ReadError, WalIterator};
 use crate::wal::writer::{WalWriter, WriteError};
 
-use std::fs;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use thiserror::Error;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 
 use boxkv_common::types::Entry;
+use boxkv_storage::{FileSystem, StorageError};
 
 #[derive(Debug, Error)]
 pub enum WalError {
@@ -30,9 +29,6 @@ pub enum WalError {
         source: WriteError,
     },
 }
-
-/// Private trait to add file path context to Results.
-/// This implements the "Extension Trait" pattern for cleaner error handling.
 trait WalContext<T, E> {
     fn with_context(self, path: &Path) -> Result<T, WalError>;
 }
@@ -55,60 +51,60 @@ impl<T> WalContext<T, WriteError> for Result<T, WriteError> {
     }
 }
 
-impl<T> WalContext<T, std::io::Error> for Result<T, std::io::Error> {
+impl<T> WalContext<T, StorageError> for Result<T, StorageError> {
     fn with_context(self, path: &Path) -> Result<T, WalError> {
         self.map_err(|e| WalError::Read {
             path: path.to_path_buf(),
-            source: ReadError::Io(e),
+            source: ReadError::Storage(e),
         })
     }
 }
 
-/// WAL Binary Format Specification
+/// WAL 二进制格式规范
 ///
-/// ## Header (21 bytes, fixed):
+/// ## Header（固定 21 字节）
 /// ```text
 /// +----------+----------------+--------------+----------------+
 /// | CRC (4B) | PayloadLen (8B)| ValueTag(1B) | Seq (8B)       |
 /// +----------+----------------+--------------+----------------+
 /// ```
 ///
-/// ## Payload (variable length):
+/// ## Payload（变长）
 /// ```text
 /// +-------------+----------+----------------------+
 /// | KeyLen (8B) | Key Data | Value Section        |
 /// +-------------+----------+----------------------+
 /// ```
 ///
-/// ## Value Section (format depends on ValueTag):
+/// ## Value Section（根据 ValueTag 决定格式）
 ///
-/// **[ValueTag = 0] Normal:**
+/// **[ValueTag = 0] Normal（普通值）：**
 /// ```text
 /// +------------+
 /// | Value Data |
 /// +------------+
 /// ```
 ///
-/// **[ValueTag = 1] Tombstone:**
+/// **[ValueTag = 1] Tombstone（删除标记）：**
 /// ```text
-/// (empty - no data)
+/// (空，无数据)
 /// ```
 ///
-/// **[ValueTag = 2] Expiring:**
+/// **[ValueTag = 2] Expiring（带过期时间）：**
 /// ```text
 /// +-------------+------------+
 /// | ExpireAt(8B)| Value Data |
 /// +-------------+------------+
 /// ```
 ///
-/// ## CRC Checksum Coverage:
-/// The CRC32 checksum covers all fields except itself:
-/// - PayloadLen (8 bytes)
-/// - ValueTag (1 byte)
-/// - Seq (8 bytes)
-/// - KeyLen (8 bytes)
-/// - Key Data (variable)
-/// - Value Section (variable)
+/// ## CRC32 校验范围
+/// 校验和覆盖除自身外的所有字段：
+/// - PayloadLen (8 字节)
+/// - ValueTag (1 字节)
+/// - Seq (8 字节)
+/// - KeyLen (8 字节)
+/// - Key Data (变长)
+/// - Value Section (变长)
 const WAL_CRC_SIZE: usize = 4;
 const WAL_PAYLOAD_LEN_SIZE: usize = 8;
 const WAL_TYPE_SIZE: usize = 1;
@@ -118,85 +114,55 @@ const WAL_HEADER_SIZE: usize = WAL_CRC_SIZE + WAL_PAYLOAD_LEN_SIZE + WAL_TYPE_SI
 const WAL_KEY_LEN_SIZE: usize = 8;
 const WAL_EXPIRE_LEN_SIZE: usize = 8;
 
-/// Manages the Write-Ahead Log (WAL) for data persistence and crash recovery.
-///
-/// This struct represents the *active* WAL file being written to.
-pub struct Wal {
-    writer: WalWriter,
+/// WAL 管理器
+pub struct Wal<FS: FileSystem> {
+    writer: WalWriter<FS>,
     path: PathBuf,
 }
 
-impl Wal {
-    /// Creates a new active WAL file for writing.
-    ///
-    /// # Arguments
-    /// * `dir` - Directory path where the WAL file will be created
-    /// * `file_id` - Unique file identifier (formatted as 9-digit zero-padded filename)
-    ///
-    /// # File Naming
-    /// Files are named as `{:09}.wal`, e.g., `000000001.wal`, `000000042.wal`
-    ///
-    /// # Errors
-    /// Returns `WalError::Write` if file creation fails.
-    pub fn create(dir: PathBuf, file_id: u64) -> Result<Self, WalError> {
+impl<FS: FileSystem> Wal<FS> {
+    /// 创建新的 WAL 文件（文件名格式：{:09}.wal）
+    pub fn create(fs: &FS, dir: PathBuf, file_id: u64) -> Result<Self, WalError> {
         let path = dir.join(format!("{:09}.wal", file_id));
 
         info!(file_id, ?path, "Creating WAL file");
 
         Ok(Self {
-            writer: WalWriter::new(path.clone()).with_context(&path)?,
+            writer: WalWriter::new(fs, path.clone()).with_context(&path)?,
             path,
         })
     }
 
-    /// Recovers all entries from WAL files in the specified directory.
-    ///
-    /// This function performs crash recovery by:
-    /// 1. Scanning all `.wal` files in the directory
-    /// 2. Sorting them by file ID (chronological order)
-    /// 3. Reading entries from each file sequentially
-    /// 4. Filtering out entries with `seq < min_seq` (already persisted to SSTable)
-    /// 5. Sorting all recovered entries by sequence number
-    ///
-    /// # Arguments
-    /// * `dir` - Directory containing WAL files
-    /// * `min_seq` - Minimum sequence number to recover (entries below this are skipped)
-    ///
-    /// # Returns
-    /// A tuple containing:
-    /// - `Vec<Entry>` - All recovered entries sorted by sequence number
-    /// - `u64` - Maximum sequence number found (used to resume sequence allocation)
-    ///
-    /// # Error Handling
-    /// - Truncated WAL files (partial last record) are handled gracefully with a warning
-    /// - CRC mismatches result in an error
-    /// - I/O errors are propagated
-    pub fn read_all_entries(dir: PathBuf, min_seq: u64) -> Result<(Vec<Entry>, u64), WalError> {
-        info!(min_seq, ?dir, "Starting WAL recovery");
+    /// 从目录中恢复所有 WAL 条目
+    pub fn read_all_entries(
+        fs: &FS,
+        dir: PathBuf,
+        min_sequence: u64,
+    ) -> Result<(Vec<Entry>, u64), WalError> {
+        info!(min_sequence, ?dir, "Starting WAL recovery");
         let start = std::time::Instant::now();
 
-        let read_dir = fs::read_dir(&dir).with_context(&dir)?;
+        let file_list = fs.list_dir(&dir).with_context(&dir)?;
 
         let mut wal_files: Vec<(u64, PathBuf)> = Vec::new();
 
-        // 1. Scan directory for WAL files
-        for entry in read_dir {
-            let entry = entry.with_context(&dir)?;
-            let path = entry.path();
+        // 扫描目录中的 WAL 文件
+        for filename in file_list {
+            let path = dir.join(&filename);
 
-            if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("wal") {
+            if !filename.ends_with(".wal") {
                 continue;
             }
 
-            // Parse file ID from filename (e.g., "000000001.wal" -> 1)
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            // 解析文件 ID
+            if let Some(stem) = filename.strip_suffix(".wal")
                 && let Ok(id) = stem.parse::<u64>()
             {
                 wal_files.push((id, path));
             }
         }
 
-        // 2. Sort files by ID to ensure chronological order
+        // 按 ID 排序确保时间顺序
         wal_files.sort_unstable_by_key(|&(id, _)| id);
 
         debug!(file_count = wal_files.len(), "Scanned WAL files");
@@ -204,33 +170,55 @@ impl Wal {
         let mut max_seq = u64::MIN;
         let mut all_entries = Vec::new();
 
-        // 3. Iterate through each file and read records
+        // 遍历文件并读取记录
         for (file_id, path) in &wal_files {
-            let file = File::open(path).with_context(path)?;
+            // 检查文件大小
+            let file_size = fs.file_size(path).with_context(path)?;
+            debug!(
+                file_id,
+                ?path,
+                file_size,
+                "WAL Recovery: Opening file for reading"
+            );
+
+            if file_size == 0 {
+                warn!(file_id, ?path, "WAL Recovery: File is empty, skipping");
+                continue;
+            }
+
+            let file = fs.open_read(path).with_context(path)?;
             let read_it = WalIterator::new(file);
 
             let mut entry_count = 0;
             for res in read_it {
                 match res {
                     Ok(entry) => {
-                        if entry.seq() >= min_seq {
-                            max_seq = max_seq.max(entry.seq());
+                        if entry.sequence >= min_sequence {
+                            max_seq = max_seq.max(entry.sequence);
                             all_entries.push(entry);
                             entry_count += 1;
                         }
                     }
                     Err(ReadError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        // Warn: WAL file truncated at the end.
-                        // This is expected if the system crashed while writing the last record.
-                        // We ignore the partial record and stop reading this file.
                         warn!(
                             file_id,
                             ?path,
+                            file_size,
+                            entry_count,
+                            error = ?e,
                             "WAL file truncated, skipping partial record"
                         );
                         break;
                     }
                     Err(e) => {
+                        warn!(
+                            file_id,
+                            ?path,
+                            file_size,
+                            entry_count,
+                            error = ?e,
+                            "WAL Recovery: Error reading entry"
+                        );
                         return Err(WalError::Read {
                             path: path.clone(),
                             source: e,
@@ -242,10 +230,8 @@ impl Wal {
             debug!(file_id, entry_count, ?path, "Completed reading WAL file");
         }
 
-        // 4. Final sort by sequence number
-        // This handles potential out-of-order writes if multiple threads allocated Seqs
-        // but wrote to the WAL in a slightly different physical order.
-        all_entries.sort_by_key(|r| r.seq());
+        // 最终按 sequence 排序
+        all_entries.sort_by_key(|r| r.sequence);
 
         let elapsed = start.elapsed();
         info!(
@@ -258,93 +244,78 @@ impl Wal {
         Ok((all_entries, max_seq))
     }
 
-    /// Appends a PUT operation to the WAL.
-    ///
-    /// # Arguments
-    /// * `seq` - Sequence number for MVCC
-    /// * `key` - Key bytes
-    /// * `val` - Value bytes
-    pub fn append_normal(&mut self, seq: u64, key: Bytes, val: Bytes) -> Result<(), WalError> {
-        trace!(
-            seq,
-            key_len = key.len(),
-            val_len = val.len(),
-            "Appending PUT to WAL"
-        );
-
+    /// 追加普通值
+    pub fn append_normal(
+        &mut self,
+        sequence: u64,
+        key: Bytes,
+        value: Bytes,
+    ) -> Result<(), WalError> {
         self.writer
-            .append(&Entry::new_normal(seq, key, val))
+            .append(&Entry::new_normal(key, value, sequence))
             .with_context(&self.path)?;
 
         Ok(())
     }
 
-    /// Appends a DELETE operation (Tombstone) to the WAL.
-    ///
-    /// # Arguments
-    /// * `seq` - Sequence number for MVCC
-    /// * `key` - Key to delete
-    pub fn append_tombstone(&mut self, seq: u64, key: Bytes) -> Result<(), WalError> {
-        trace!(seq, key_len = key.len(), "Appending DELETE to WAL");
+    /// 批量追加条目
+    pub fn append_batch(&mut self, entries: &[Entry]) -> Result<(), WalError> {
+        self.writer.append_batch(entries).with_context(&self.path)
+    }
 
+    /// 追加删除标记
+    pub fn append_tombstone(&mut self, sequence: u64, key: Bytes) -> Result<(), WalError> {
         self.writer
-            .append(&Entry::new_tombstone(seq, key))
+            .append(&Entry::new_tombstone(key, sequence))
             .with_context(&self.path)?;
 
         Ok(())
     }
 
-    /// Appends an expiring value entry with TTL to the WAL.
-    ///
-    /// # Arguments
-    /// * `seq` - Sequence number for MVCC
-    /// * `key` - Key bytes
-    /// * `val` - Value bytes
-    /// * `expire_at` - Unix timestamp (seconds) when this entry expires
+    /// 追加带过期时间的值
     pub fn append_expire(
         &mut self,
-        seq: u64,
+        sequence: u64,
         key: Bytes,
-        val: Bytes,
+        value: Bytes,
         expire_at: u64,
     ) -> Result<(), WalError> {
-        trace!(seq, key_len = key.len(), "Appending EXPIRE to WAL");
-
         self.writer
-            .append(&Entry::new_expiring(seq, key, val, expire_at))
+            .append(&Entry::new_expiring(key, value, sequence, expire_at))
             .with_context(&self.path)?;
 
         Ok(())
     }
 
-    /// Deletes a WAL file by its ID.
-    ///
-    /// This is typically called after the corresponding Memtable has been successfully
-    /// flushed to an SSTable file. Once persisted to disk via SSTable, the WAL records
-    /// are no longer needed for recovery.
-    ///
-    /// # Arguments
-    /// * `dir` - Directory containing the WAL file
-    /// * `file_id` - File identifier to delete
-    pub fn delete(dir: PathBuf, file_id: u64) -> Result<(), WalError> {
+    /// 删除 WAL 文件（通常在 Flush 到 SSTable 后调用）
+    pub fn delete(fs: &FS, dir: PathBuf, file_id: u64) -> Result<(), WalError> {
         let path = dir.join(format!("{:09}.wal", file_id));
 
         info!(file_id, ?path, "Deleting WAL file");
 
-        fs::remove_file(&path).with_context(&path)
+        fs.delete(&path).with_context(&path)
     }
 
-    /// Syncs all pending writes to physical disk (fsync).
-    ///
-    /// This ensures durability by flushing:
-    /// 1. BufWriter buffer to OS page cache
-    /// 2. OS page cache to physical disk
-    ///
-    /// Must be called to guarantee crash recovery works correctly.
+    /// 同步到磁盘（fsync）
     pub fn sync(&mut self) -> Result<(), WalError> {
         debug!(?self.path, "Syncing WAL to disk");
 
         self.writer.sync().with_context(&self.path)?;
+        Ok(())
+    }
+
+    /// 切换到新的 WAL 文件
+    pub fn rotate(
+        &mut self,
+        fs: &FS,
+        dir: &std::path::Path,
+        new_file_id: u64,
+    ) -> Result<(), WalError> {
+        self.sync()?;
+
+        let new_path = dir.join(format!("{:09}.wal", new_file_id));
+        self.writer = WalWriter::new(fs, new_path.clone()).with_context(&new_path)?;
+        self.path = new_path;
         Ok(())
     }
 }
@@ -353,30 +324,33 @@ impl Wal {
 mod tests {
     use super::*;
     use boxkv_common::types::ValueType;
+    use boxkv_storage::LocalFileSystem;
     use tempfile::TempDir;
 
     #[test]
     fn test_wal_create_and_file_naming() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
 
-        let _wal = Wal::create(dir_path.clone(), 1).unwrap();
-        assert!(dir_path.join("000000001.wal").exists());
+        let _wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
+        assert!(fs.exists(&dir_path.join("000000001.wal")));
 
-        let _wal2 = Wal::create(dir_path.clone(), 42).unwrap();
-        assert!(dir_path.join("000000042.wal").exists());
+        let _wal2 = Wal::create(&fs, dir_path.clone(), 42).unwrap();
+        assert!(fs.exists(&dir_path.join("000000042.wal")));
 
-        let _wal3 = Wal::create(dir_path.clone(), 123456789).unwrap();
-        assert!(dir_path.join("123456789.wal").exists());
+        let _wal3 = Wal::create(&fs, dir_path.clone(), 123456789).unwrap();
+        assert!(fs.exists(&dir_path.join("123456789.wal")));
     }
 
     #[test]
     fn test_wal_append_normal_value() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
 
         {
-            let mut wal = Wal::create(dir_path.clone(), 1).unwrap();
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
             wal.append_normal(100, Bytes::from("key1"), Bytes::from("value1"))
                 .unwrap();
             wal.append_normal(101, Bytes::from("key2"), Bytes::from("value2"))
@@ -384,20 +358,20 @@ mod tests {
             wal.sync().unwrap();
         }
 
-        let (entries, max_seq) = Wal::read_all_entries(dir_path, 0).unwrap();
+        let (entries, max_seq) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
         assert_eq!(max_seq, 101);
         assert_eq!(entries.len(), 2);
 
-        assert_eq!(entries[0].seq(), 100);
-        assert_eq!(entries[0].key().as_ref(), b"key1");
-        match entries[0].val() {
+        assert_eq!(entries[0].sequence, 100);
+        assert_eq!(entries[0].key.as_ref(), b"key1");
+        match &entries[0].value {
             ValueType::Normal(data) => assert_eq!(data.as_ref(), b"value1"),
             _ => panic!("Expected Normal value"),
         }
 
-        assert_eq!(entries[1].seq(), 101);
-        assert_eq!(entries[1].key().as_ref(), b"key2");
-        match entries[1].val() {
+        assert_eq!(entries[1].sequence, 101);
+        assert_eq!(entries[1].key.as_ref(), b"key2");
+        match &entries[1].value {
             ValueType::Normal(data) => assert_eq!(data.as_ref(), b"value2"),
             _ => panic!("Expected Normal value"),
         }
@@ -407,33 +381,35 @@ mod tests {
     fn test_wal_append_tombstone() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
 
         {
-            let mut wal = Wal::create(dir_path.clone(), 1).unwrap();
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
             wal.append_tombstone(200, Bytes::from("deleted_key"))
                 .unwrap();
             wal.sync().unwrap();
         }
 
-        let (entries, max_seq) = Wal::read_all_entries(dir_path, 0).unwrap();
+        let (entries, max_seq) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
         assert_eq!(max_seq, 200);
         assert_eq!(entries.len(), 1);
 
-        assert_eq!(entries[0].seq(), 200);
-        assert_eq!(entries[0].key().as_ref(), b"deleted_key");
+        assert_eq!(entries[0].sequence, 200);
+        assert_eq!(entries[0].key.as_ref(), b"deleted_key");
         assert!(entries[0].is_tombstone());
-        assert!(matches!(entries[0].val(), ValueType::Tombstone));
+        assert!(matches!(entries[0].value, ValueType::Tombstone));
     }
 
     #[test]
     fn test_wal_append_expiring_value() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
 
         let expire_at = 1234567890u64;
 
         {
-            let mut wal = Wal::create(dir_path.clone(), 1).unwrap();
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
             wal.append_expire(
                 300,
                 Bytes::from("expire_key"),
@@ -444,13 +420,13 @@ mod tests {
             wal.sync().unwrap();
         }
 
-        let (entries, max_seq) = Wal::read_all_entries(dir_path, 0).unwrap();
+        let (entries, max_seq) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
         assert_eq!(max_seq, 300);
         assert_eq!(entries.len(), 1);
 
-        assert_eq!(entries[0].seq(), 300);
-        assert_eq!(entries[0].key().as_ref(), b"expire_key");
-        match entries[0].val() {
+        assert_eq!(entries[0].sequence, 300);
+        assert_eq!(entries[0].key.as_ref(), b"expire_key");
+        match &entries[0].value {
             ValueType::Expiring {
                 data,
                 expire_at: exp,
@@ -466,9 +442,10 @@ mod tests {
     fn test_wal_mixed_value_types() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
 
         {
-            let mut wal = Wal::create(dir_path.clone(), 1).unwrap();
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
             wal.append_normal(1, Bytes::from("k1"), Bytes::from("v1"))
                 .unwrap();
             wal.append_tombstone(2, Bytes::from("k2")).unwrap();
@@ -479,24 +456,24 @@ mod tests {
             wal.sync().unwrap();
         }
 
-        let (entries, max_seq) = Wal::read_all_entries(dir_path, 0).unwrap();
+        let (entries, max_seq) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
         assert_eq!(max_seq, 4);
         assert_eq!(entries.len(), 4);
 
-        assert!(matches!(entries[0].val(), ValueType::Normal(_)));
-        assert!(matches!(entries[1].val(), ValueType::Tombstone));
-        assert!(matches!(entries[2].val(), ValueType::Expiring { .. }));
-        assert!(matches!(entries[3].val(), ValueType::Normal(_)));
+        assert!(matches!(entries[0].value, ValueType::Normal(_)));
+        assert!(matches!(entries[1].value, ValueType::Tombstone));
+        assert!(matches!(entries[2].value, ValueType::Expiring { .. }));
+        assert!(matches!(entries[3].value, ValueType::Normal(_)));
     }
 
     #[test]
     fn test_wal_multiple_files_recovery() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
 
-        // Create WAL file 1
         {
-            let mut wal1 = Wal::create(dir_path.clone(), 1).unwrap();
+            let mut wal1 = Wal::create(&fs, dir_path.clone(), 1).unwrap();
             wal1.append_normal(10, Bytes::from("k1"), Bytes::from("v1"))
                 .unwrap();
             wal1.append_normal(20, Bytes::from("k2"), Bytes::from("v2"))
@@ -504,43 +481,40 @@ mod tests {
             wal1.sync().unwrap();
         }
 
-        // Create WAL file 2
         {
-            let mut wal2 = Wal::create(dir_path.clone(), 2).unwrap();
+            let mut wal2 = Wal::create(&fs, dir_path.clone(), 2).unwrap();
             wal2.append_normal(30, Bytes::from("k3"), Bytes::from("v3"))
                 .unwrap();
             wal2.append_tombstone(40, Bytes::from("k1")).unwrap();
             wal2.sync().unwrap();
         }
 
-        // Create WAL file 3
         {
-            let mut wal3 = Wal::create(dir_path.clone(), 3).unwrap();
+            let mut wal3 = Wal::create(&fs, dir_path.clone(), 3).unwrap();
             wal3.append_expire(50, Bytes::from("k4"), Bytes::from("v4"), 8888)
                 .unwrap();
             wal3.sync().unwrap();
         }
 
-        // Recover all
-        let (entries, max_seq) = Wal::read_all_entries(dir_path.clone(), 0).unwrap();
+        let (entries, max_seq) = Wal::read_all_entries(&fs, dir_path.clone(), 0).unwrap();
         assert_eq!(max_seq, 50);
         assert_eq!(entries.len(), 5);
 
-        // Verify chronological order
-        assert_eq!(entries[0].seq(), 10);
-        assert_eq!(entries[1].seq(), 20);
-        assert_eq!(entries[2].seq(), 30);
-        assert_eq!(entries[3].seq(), 40);
-        assert_eq!(entries[4].seq(), 50);
+        assert_eq!(entries[0].sequence, 10);
+        assert_eq!(entries[1].sequence, 20);
+        assert_eq!(entries[2].sequence, 30);
+        assert_eq!(entries[3].sequence, 40);
+        assert_eq!(entries[4].sequence, 50);
     }
 
     #[test]
-    fn test_wal_min_seq_filtering() {
+    fn test_wal_min_sequence_filtering() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
 
         {
-            let mut wal = Wal::create(dir_path.clone(), 1).unwrap();
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
             wal.append_normal(10, Bytes::from("k1"), Bytes::from("v1"))
                 .unwrap();
             wal.append_normal(20, Bytes::from("k2"), Bytes::from("v2"))
@@ -552,21 +526,18 @@ mod tests {
             wal.sync().unwrap();
         }
 
-        // Filter seq < 25 (should get seq 30 and 40)
-        let (entries, max_seq) = Wal::read_all_entries(dir_path.clone(), 25).unwrap();
+        let (entries, max_seq) = Wal::read_all_entries(&fs, dir_path.clone(), 25).unwrap();
         assert_eq!(max_seq, 40);
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].seq(), 30);
-        assert_eq!(entries[1].seq(), 40);
+        assert_eq!(entries[0].sequence, 30);
+        assert_eq!(entries[1].sequence, 40);
 
-        // Filter seq < 40 (should get only seq 40)
-        let (entries, max_seq) = Wal::read_all_entries(dir_path.clone(), 40).unwrap();
+        let (entries, max_seq) = Wal::read_all_entries(&fs, dir_path.clone(), 40).unwrap();
         assert_eq!(max_seq, 40);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].seq(), 40);
+        assert_eq!(entries[0].sequence, 40);
 
-        // Filter seq < 100 (should get nothing)
-        let (entries, _) = Wal::read_all_entries(dir_path, 100).unwrap();
+        let (entries, _) = Wal::read_all_entries(&fs, dir_path, 100).unwrap();
         assert_eq!(entries.len(), 0);
     }
 
@@ -574,25 +545,26 @@ mod tests {
     fn test_wal_delete_file() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
 
-        let _wal = Wal::create(dir_path.clone(), 1).unwrap();
+        let _wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
         let file_path = dir_path.join("000000001.wal");
-        assert!(file_path.exists());
+        assert!(fs.exists(&file_path));
 
-        Wal::delete(dir_path.clone(), 1).unwrap();
-        assert!(!file_path.exists());
+        Wal::delete(&fs, dir_path.clone(), 1).unwrap();
+        assert!(!fs.exists(&file_path));
 
         // Deleting non-existent file should return error
-        assert!(Wal::delete(dir_path, 999).is_err());
+        assert!(Wal::delete(&fs, dir_path, 999).is_err());
     }
 
     #[test]
     fn test_wal_empty_recovery() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
 
-        // No WAL files exist
-        let (entries, max_seq) = Wal::read_all_entries(dir_path, 0).unwrap();
+        let (entries, max_seq) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
         assert_eq!(entries.len(), 0);
         assert_eq!(max_seq, u64::MIN);
     }
@@ -601,12 +573,13 @@ mod tests {
     fn test_wal_large_values() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
 
-        let large_key = vec![b'k'; 1024]; // 1KB key
-        let large_value = vec![b'v'; 1024 * 1024]; // 1MB value
+        let large_key = vec![b'k'; 1024];
+        let large_value = vec![b'v'; 1024 * 1024];
 
         {
-            let mut wal = Wal::create(dir_path.clone(), 1).unwrap();
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
             wal.append_normal(
                 1,
                 Bytes::from(large_key.clone()),
@@ -616,10 +589,10 @@ mod tests {
             wal.sync().unwrap();
         }
 
-        let (entries, _) = Wal::read_all_entries(dir_path, 0).unwrap();
+        let (entries, _) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key().len(), 1024);
-        match entries[0].val() {
+        assert_eq!(entries[0].key.len(), 1024);
+        match &entries[0].value {
             ValueType::Normal(data) => assert_eq!(data.len(), 1024 * 1024),
             _ => panic!("Expected Normal value"),
         }
@@ -629,32 +602,33 @@ mod tests {
     fn test_wal_empty_key_and_value() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
 
         {
-            let mut wal = Wal::create(dir_path.clone(), 1).unwrap();
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
             wal.append_normal(1, Bytes::from(""), Bytes::from(""))
                 .unwrap();
             wal.append_tombstone(2, Bytes::from("")).unwrap();
             wal.sync().unwrap();
         }
 
-        let (entries, _) = Wal::read_all_entries(dir_path, 0).unwrap();
+        let (entries, _) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].key().len(), 0);
-        assert_eq!(entries[1].key().len(), 0);
+        assert_eq!(entries[0].key.len(), 0);
+        assert_eq!(entries[1].key.len(), 0);
     }
 
     #[test]
     fn test_wal_binary_key_and_value() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
 
-        // Binary data with all byte values
         let binary_key: Vec<u8> = (0..=255).collect();
         let binary_value: Vec<u8> = (0..=255).rev().collect();
 
         {
-            let mut wal = Wal::create(dir_path.clone(), 1).unwrap();
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
             wal.append_normal(
                 1,
                 Bytes::from(binary_key.clone()),
@@ -664,10 +638,10 @@ mod tests {
             wal.sync().unwrap();
         }
 
-        let (entries, _) = Wal::read_all_entries(dir_path, 0).unwrap();
+        let (entries, _) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].key().as_ref(), binary_key.as_slice());
-        match entries[0].val() {
+        assert_eq!(entries[0].key.as_ref(), binary_key.as_slice());
+        match &entries[0].value {
             ValueType::Normal(data) => assert_eq!(data.as_ref(), binary_value.as_slice()),
             _ => panic!("Expected Normal value"),
         }
@@ -677,10 +651,10 @@ mod tests {
     fn test_wal_sequence_number_ordering() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
 
         {
-            let mut wal = Wal::create(dir_path.clone(), 1).unwrap();
-            // Write in non-sequential order
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
             wal.append_normal(100, Bytes::from("k100"), Bytes::from("v100"))
                 .unwrap();
             wal.append_normal(50, Bytes::from("k50"), Bytes::from("v50"))
@@ -692,32 +666,413 @@ mod tests {
             wal.sync().unwrap();
         }
 
-        let (entries, max_seq) = Wal::read_all_entries(dir_path, 0).unwrap();
+        let (entries, max_seq) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
         assert_eq!(max_seq, 200);
         assert_eq!(entries.len(), 4);
 
-        // Should be sorted by sequence number
-        assert_eq!(entries[0].seq(), 50);
-        assert_eq!(entries[1].seq(), 75);
-        assert_eq!(entries[2].seq(), 100);
-        assert_eq!(entries[3].seq(), 200);
+        assert_eq!(entries[0].sequence, 50);
+        assert_eq!(entries[1].sequence, 75);
+        assert_eq!(entries[2].sequence, 100);
+        assert_eq!(entries[3].sequence, 200);
     }
 
     #[test]
     fn test_wal_sync_durability() {
         let temp_dir = TempDir::new().unwrap();
         let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
 
         {
-            let mut wal = Wal::create(dir_path.clone(), 1).unwrap();
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
             wal.append_normal(1, Bytes::from("k1"), Bytes::from("v1"))
                 .unwrap();
-            // sync() ensures data is on disk
+            wal.sync().unwrap();
+        }
+        let (entries, _) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_wal_concurrent_writes() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+        let fs = Arc::new(LocalFileSystem);
+
+        let mut handles = vec![];
+        let num_threads = 10;
+        let entries_per_thread = 100;
+
+        for thread_id in 0..num_threads {
+            let fs = Arc::clone(&fs);
+            let dir_path = dir_path.clone();
+            let handle = thread::spawn(move || {
+                let mut wal = Wal::create(&*fs, dir_path.clone(), thread_id as u64).unwrap();
+                for i in 0..entries_per_thread {
+                    let sequence = (thread_id * entries_per_thread + i) as u64;
+                    let key = format!("thread_{}_key_{}", thread_id, i);
+                    let value = format!("thread_{}_value_{}", thread_id, i);
+                    wal.append_normal(sequence, Bytes::from(key), Bytes::from(value))
+                        .unwrap();
+                }
+                wal.sync().unwrap();
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let (entries, max_seq) = Wal::read_all_entries(&*fs, dir_path, 0).unwrap();
+        assert_eq!(entries.len(), num_threads * entries_per_thread);
+        assert_eq!(max_seq, (num_threads * entries_per_thread - 1) as u64);
+
+        for i in 1..entries.len() {
+            assert!(entries[i].sequence >= entries[i - 1].sequence);
+        }
+    }
+
+    #[test]
+    fn test_wal_high_volume_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
+
+        let num_entries: usize = 10000;
+
+        {
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
+            for i in 0..num_entries {
+                let key = format!("key_{:05}", i);
+                let value = format!("value_{:05}", i);
+                wal.append_normal(i as u64, Bytes::from(key), Bytes::from(value))
+                    .unwrap();
+            }
             wal.sync().unwrap();
         }
 
-        // Drop wal without explicit sync should still work because we called sync()
-        let (entries, _) = Wal::read_all_entries(dir_path, 0).unwrap();
+        let (entries, max_seq) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
+        assert_eq!(entries.len(), num_entries);
+        assert_eq!(max_seq, (num_entries - 1) as u64);
+
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.sequence, i as u64);
+            assert_eq!(entry.key, format!("key_{:05}", i));
+            match &entry.value {
+                ValueType::Normal(data) => {
+                    assert_eq!(data.as_ref(), format!("value_{:05}", i).as_bytes());
+                }
+                _ => panic!("Expected Normal value"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_wal_mixed_operations_sequence() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
+
+        {
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
+            wal.append_normal(1, Bytes::from("user:1"), Bytes::from("Alice"))
+                .unwrap();
+            wal.append_normal(2, Bytes::from("user:2"), Bytes::from("Bob"))
+                .unwrap();
+            wal.append_normal(3, Bytes::from("user:3"), Bytes::from("Charlie"))
+                .unwrap();
+            wal.append_tombstone(4, Bytes::from("user:2")).unwrap();
+            wal.append_normal(5, Bytes::from("user:2"), Bytes::from("BobV2"))
+                .unwrap();
+            wal.append_expire(
+                6,
+                Bytes::from("session:abc"),
+                Bytes::from("token123"),
+                1234567890,
+            )
+            .unwrap();
+            wal.sync().unwrap();
+        }
+
+        let (entries, max_seq) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
+        assert_eq!(entries.len(), 6);
+        assert_eq!(max_seq, 6);
+
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[0].key.as_ref(), b"user:1");
+        assert_eq!(entries[1].sequence, 2);
+        assert_eq!(entries[2].sequence, 3);
+        assert_eq!(entries[3].sequence, 4);
+        assert!(entries[3].is_tombstone());
+        assert_eq!(entries[4].sequence, 5);
+        assert_eq!(entries[5].sequence, 6);
+        assert!(matches!(entries[5].value, ValueType::Expiring { .. }));
+    }
+
+    #[test]
+    fn test_wal_file_id_ordering() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
+
+        {
+            let mut wal3 = Wal::create(&fs, dir_path.clone(), 3).unwrap();
+            wal3.append_normal(30, Bytes::from("k3"), Bytes::from("v3"))
+                .unwrap();
+            wal3.sync().unwrap();
+        }
+
+        {
+            let mut wal1 = Wal::create(&fs, dir_path.clone(), 1).unwrap();
+            wal1.append_normal(10, Bytes::from("k1"), Bytes::from("v1"))
+                .unwrap();
+            wal1.sync().unwrap();
+        }
+
+        {
+            let mut wal2 = Wal::create(&fs, dir_path.clone(), 2).unwrap();
+            wal2.append_normal(20, Bytes::from("k2"), Bytes::from("v2"))
+                .unwrap();
+            wal2.sync().unwrap();
+        }
+
+        let (entries, _) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].sequence, 10);
+        assert_eq!(entries[1].sequence, 20);
+        assert_eq!(entries[2].sequence, 30);
+    }
+
+    #[test]
+    fn test_wal_max_sequence_tracking() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
+
+        {
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
+            wal.append_normal(1000, Bytes::from("k1"), Bytes::from("v1"))
+                .unwrap();
+            wal.append_normal(5000, Bytes::from("k2"), Bytes::from("v2"))
+                .unwrap();
+            wal.append_normal(2000, Bytes::from("k3"), Bytes::from("v3"))
+                .unwrap();
+            wal.sync().unwrap();
+        }
+
+        let (_, max_seq) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
+        assert_eq!(max_seq, 5000);
+    }
+
+    #[test]
+    fn test_wal_unicode_keys_and_values() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
+
+        let unicode_key = "用户:123";
+        let unicode_value = "值:测试数据🎉";
+
+        {
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
+            wal.append_normal(1, Bytes::from(unicode_key), Bytes::from(unicode_value))
+                .unwrap();
+            wal.sync().unwrap();
+        }
+
+        let (entries, _) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
         assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key.as_ref(), unicode_key.as_bytes());
+        match &entries[0].value {
+            ValueType::Normal(data) => {
+                assert_eq!(data.as_ref(), unicode_value.as_bytes());
+            }
+            _ => panic!("Expected Normal value"),
+        }
+    }
+
+    #[test]
+    fn test_wal_repeated_keys() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
+
+        {
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
+            wal.append_normal(1, Bytes::from("key"), Bytes::from("v1"))
+                .unwrap();
+            wal.append_normal(2, Bytes::from("key"), Bytes::from("v2"))
+                .unwrap();
+            wal.append_normal(3, Bytes::from("key"), Bytes::from("v3"))
+                .unwrap();
+            wal.sync().unwrap();
+        }
+
+        let (entries, _) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
+        assert_eq!(entries.len(), 3);
+        for entry in &entries {
+            assert_eq!(entry.key.as_ref(), b"key");
+        }
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 2);
+        assert_eq!(entries[2].sequence, 3);
+    }
+
+    #[test]
+    fn test_wal_expiring_value_recovery() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
+
+        let expire_at = 1234567890u64;
+
+        {
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
+            wal.append_expire(1, Bytes::from("key"), Bytes::from("value"), expire_at)
+                .unwrap();
+            wal.sync().unwrap();
+        }
+
+        let (entries, _) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].value {
+            ValueType::Expiring {
+                data,
+                expire_at: exp,
+            } => {
+                assert_eq!(data.as_ref(), b"value");
+                assert_eq!(*exp, expire_at);
+            }
+            _ => panic!("Expected Expiring value"),
+        }
+    }
+
+    #[test]
+    fn test_wal_performance_benchmark() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
+
+        let num_entries: usize = 1000;
+        let start = std::time::Instant::now();
+
+        {
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
+            for i in 0..num_entries {
+                let key = format!("key_{}", i);
+                let value = format!("value_{}", i);
+                wal.append_normal(i as u64, Bytes::from(key), Bytes::from(value))
+                    .unwrap();
+            }
+            wal.sync().unwrap();
+        }
+
+        let write_duration = start.elapsed();
+
+        let read_start = std::time::Instant::now();
+        let (entries, _) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
+        let read_duration = read_start.elapsed();
+
+        assert_eq!(entries.len(), num_entries);
+
+        println!(
+            "WAL Performance: {} entries - Write: {:?}, Read: {:?}",
+            num_entries, write_duration, read_duration
+        );
+
+        assert!(write_duration.as_millis() < 10000);
+        assert!(read_duration.as_millis() < 5000);
+    }
+
+    #[test]
+    fn test_wal_zero_sequence() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
+
+        {
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
+            wal.append_normal(0, Bytes::from("k0"), Bytes::from("v0"))
+                .unwrap();
+            wal.sync().unwrap();
+        }
+
+        let (entries, max_seq) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(max_seq, 0);
+        assert_eq!(entries[0].sequence, 0);
+    }
+
+    #[test]
+    fn test_wal_max_u64_sequence() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
+
+        let max_seq = u64::MAX;
+
+        {
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
+            wal.append_normal(max_seq, Bytes::from("k"), Bytes::from("v"))
+                .unwrap();
+            wal.sync().unwrap();
+        }
+
+        let (entries, recovered_max) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(recovered_max, max_seq);
+        assert_eq!(entries[0].sequence, max_seq);
+    }
+
+    #[test]
+    fn test_wal_filtering_edge_cases() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
+
+        {
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
+            wal.append_normal(10, Bytes::from("k1"), Bytes::from("v1"))
+                .unwrap();
+            wal.append_normal(20, Bytes::from("k2"), Bytes::from("v2"))
+                .unwrap();
+            wal.sync().unwrap();
+        }
+
+        let (entries, _) = Wal::read_all_entries(&fs, dir_path.clone(), 10).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        let (entries, _) = Wal::read_all_entries(&fs, dir_path.clone(), 20).unwrap();
+        assert_eq!(entries.len(), 1);
+
+        let (entries, _) = Wal::read_all_entries(&fs, dir_path, 21).unwrap();
+        assert_eq!(entries.len(), 0);
+    }
+
+    #[test]
+    fn test_wal_all_value_types_in_sequence() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+        let fs = LocalFileSystem;
+
+        {
+            let mut wal = Wal::create(&fs, dir_path.clone(), 1).unwrap();
+            wal.append_normal(1, Bytes::from("normal"), Bytes::from("data"))
+                .unwrap();
+            wal.append_tombstone(2, Bytes::from("tombstone")).unwrap();
+            wal.append_expire(3, Bytes::from("expiring"), Bytes::from("data"), 9999)
+                .unwrap();
+            wal.sync().unwrap();
+        }
+
+        let (entries, _) = Wal::read_all_entries(&fs, dir_path, 0).unwrap();
+        assert_eq!(entries.len(), 3);
+
+        assert!(matches!(entries[0].value, ValueType::Normal(_)));
+        assert!(matches!(entries[1].value, ValueType::Tombstone));
+        assert!(matches!(entries[2].value, ValueType::Expiring { .. }));
     }
 }
